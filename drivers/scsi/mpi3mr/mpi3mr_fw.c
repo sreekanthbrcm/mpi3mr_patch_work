@@ -1995,6 +1995,85 @@ out:
 }
 
 /**
+ * mpi3mr_print_pkg_ver - display controller fw package version
+ * @mrioc: Adapter reference
+ *
+ * Retrieve firmware package version from the component image
+ * header of the controller flash and display it.
+ *
+ * Return: 0 on success and non-zero on failure.
+ */
+static int mpi3mr_print_pkg_ver(struct mpi3mr_ioc *mrioc)
+{
+	struct mpi3_ci_upload_request ci_upload;
+	int retval = -1;
+	void *data = NULL;
+	dma_addr_t data_dma;
+	struct mpi3_component_image_header *ci_header;
+	u32 data_len = sizeof(*ci_header);
+	u8 sgl_flags = MPI3MR_SGEFLAGS_SYSTEM_SIMPLE_END_OF_LIST;
+
+	data = dma_alloc_coherent(&mrioc->pdev->dev, data_len, &data_dma,
+	    GFP_KERNEL);
+	if (!data)
+		goto out;
+
+	memset(&ci_upload, 0, sizeof(ci_upload));
+	mutex_lock(&mrioc->init_cmds.mutex);
+	if (mrioc->init_cmds.state & MPI3MR_CMD_PENDING) {
+		ioc_err(mrioc, "sending get package version failed due to command in use\n");
+		mutex_unlock(&mrioc->init_cmds.mutex);
+		goto out;
+	}
+	mrioc->init_cmds.state = MPI3MR_CMD_PENDING;
+	mrioc->init_cmds.is_waiting = 1;
+	mrioc->init_cmds.callback = NULL;
+	ci_upload.host_tag = cpu_to_le16(MPI3MR_HOSTTAG_INITCMDS);
+	ci_upload.function = MPI3_FUNCTION_CI_UPLOAD;
+	ci_upload.msg_flags = MPI3_CI_UPLOAD_MSGFLAGS_LOCATION_PRIMARY;
+	ci_upload.image_offset = MPI3_IMAGE_HEADER_SIGNATURE0_OFFSET;
+	ci_upload.segment_size = MPI3_IMAGE_HEADER_SIZE;
+
+	mpi3mr_add_sg_single(&ci_upload.sgl, sgl_flags, data_len,
+	    data_dma);
+	init_completion(&mrioc->init_cmds.done);
+	retval = mpi3mr_admin_request_post(mrioc, &ci_upload,
+	    sizeof(ci_upload), 1);
+	if (retval) {
+		ioc_err(mrioc, "posting get package version failed\n");
+		goto out_unlock;
+	}
+	wait_for_completion_timeout(&mrioc->init_cmds.done,
+	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
+	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
+		ioc_err(mrioc, "get package version timed out\n");
+		retval = -1;
+		goto out_unlock;
+	}
+	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
+	    == MPI3_IOCSTATUS_SUCCESS) {
+		ci_header = (struct mpi3_component_image_header *) data;
+		ioc_info(mrioc, "firmware package version(%d.%d.%d.%d.%05d-%05d)\n",
+		    ci_header->component_image_version.gen_major,
+		    ci_header->component_image_version.gen_minor,
+		    ci_header->component_image_version.phase_major,
+		    ci_header->component_image_version.phase_minor,
+		    ci_header->component_image_version.customer_id,
+		    ci_header->component_image_version.build_num);
+	}
+	retval = 0;
+out_unlock:
+	mrioc->init_cmds.state = MPI3MR_CMD_NOTUSED;
+	mutex_unlock(&mrioc->init_cmds.mutex);
+
+out:
+	if (data)
+		dma_free_coherent(&mrioc->pdev->dev, data_len, data,
+		    data_dma);
+	return retval;
+}
+
+/**
  * mpi3mr_watchdog_work - watchdog thread to monitor faults
  * @work: work struct
  *
@@ -3386,6 +3465,12 @@ int mpi3mr_init_ioc(struct mpi3mr_ioc *mrioc, u8 init_type)
 	mrioc->sbq_host_index = mrioc->num_sense_bufs;
 	writel(mrioc->sbq_host_index,
 	    &mrioc->sysif_regs->sense_buffer_free_host_index);
+
+	retval = mpi3mr_print_pkg_ver(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to get package version\n");
+		goto out_failed;
+	}
 
 	if (init_type != MPI3MR_IT_RESET) {
 		retval = mpi3mr_setup_isr(mrioc, 0);
