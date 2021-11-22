@@ -143,13 +143,6 @@ extern int prot_mask;
 
 /* ResponseCode definitions */
 #define MPI3MR_RI_MASK_RESPCODE		(0x000000FF)
-#define MPI3MR_RSP_TM_COMPLETE		0x00
-#define MPI3MR_RSP_INVALID_FRAME	0x02
-#define MPI3MR_RSP_TM_NOT_SUPPORTED	0x04
-#define MPI3MR_RSP_TM_FAILED		0x05
-#define MPI3MR_RSP_TM_SUCCEEDED		0x08
-#define MPI3MR_RSP_TM_INVALID_LUN	0x09
-#define MPI3MR_RSP_TM_OVERLAPPED_TAG	0x0A
 #define MPI3MR_RSP_IO_QUEUED_ON_IOC \
 			MPI3_SCSITASKMGMT_RSPCODE_IO_QUEUED_ON_IOC
 
@@ -522,6 +515,8 @@ static inline void mpi3mr_tgtdev_put(struct mpi3mr_tgt_dev *s)
  * @dev_type: Device type
  * @dev_nvme_dif: Deice is NVMe DIF enabled
  * @tgt_dev: Internal target device pointer
+ * @pend_count: Counter to track pending I/Os during error
+ *		handling
  */
 struct mpi3mr_stgt_priv_data {
 	struct scsi_target *starget;
@@ -534,6 +529,7 @@ struct mpi3mr_stgt_priv_data {
 	u8 dev_type;
 	u8 dev_nvme_dif;
 	struct mpi3mr_tgt_dev *tgt_dev;
+	u32 pend_count;
 };
 
 /**
@@ -542,11 +538,14 @@ struct mpi3mr_stgt_priv_data {
  * @tgt_priv_data: Scsi_target private data pointer
  * @lun_id: LUN ID of the device
  * @ncq_prio_enable: NCQ priority enable for SATA device
+ * @pend_count: Counter to track pending I/Os during error
+ *		handling
  */
 struct mpi3mr_sdev_priv_data {
 	struct mpi3mr_stgt_priv_data *tgt_priv_data;
 	u32 lun_id;
 	u8 ncq_prio_enable;
+	u32 pend_count;
 };
 
 /**

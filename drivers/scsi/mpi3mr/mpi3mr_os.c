@@ -426,6 +426,74 @@ out:
 }
 
 /**
+ * mpi3mr_count_dev_pending - Count commands pending for a lun
+ * @rq: Block request
+ * @data: SCSI device reference
+ * @reserved: Unused
+ *
+ * This is an iterator function called for each SCSI command in
+ * a host and if the command is pending in the LLD for the
+ * specific device(lun) then device specific pending I/O counter
+ * is updated in the device structure.
+ *
+ * Return: true always.
+ */
+
+static bool mpi3mr_count_dev_pending(struct request *rq,
+	void *data, bool reserved)
+{
+	struct scsi_device *sdev = (struct scsi_device *)data;
+	struct mpi3mr_sdev_priv_data *sdev_priv_data = sdev->hostdata;
+	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
+	struct scmd_priv *priv;
+
+	if (scmd) {
+		priv = scsi_cmd_priv(scmd);
+		if (!priv->in_lld_scope)
+			goto out;
+		if (scmd->device == sdev)
+			sdev_priv_data->pend_count++;
+	}
+
+out:
+	return true;
+}
+
+/**
+ * mpi3mr_count_tgt_pending - Count commands pending for target
+ * @rq: Block request
+ * @data: SCSI target reference
+ * @reserved: Unused
+ *
+ * This is an iterator function called for each SCSI command in
+ * a host and if the command is pending in the LLD for the
+ * specific target then target specific pending I/O counter is
+ * updated in the target structure.
+ *
+ * Return: true always.
+ */
+
+static bool mpi3mr_count_tgt_pending(struct request *rq,
+	void *data, bool reserved)
+{
+	struct scsi_target *starget = (struct scsi_target *)data;
+	struct mpi3mr_stgt_priv_data *stgt_priv_data = starget->hostdata;
+	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
+	struct scmd_priv *priv;
+
+	if (scmd) {
+		priv = scsi_cmd_priv(scmd);
+		if (!priv->in_lld_scope)
+			goto out;
+		if (scmd->device && (scsi_target(scmd->device) == starget))
+			stgt_priv_data->pend_count++;
+	}
+
+out:
+	return true;
+}
+
+/**
  * mpi3mr_flush_host_io -  Flush host I/Os
  * @mrioc: Adapter instance reference
  *
@@ -2827,49 +2895,63 @@ static int mpi3mr_build_sg_scmd(struct mpi3mr_ioc *mrioc,
 }
 
 /**
- * mpi3mr_print_response_code - print TM response as a string
- * @mrioc: Adapter instance reference
+ * mpi3mr_tm_response_name -  get TM response as a string
  * @resp_code: TM response code
  *
- * Print TM response code as a readable string.
+ * Convert known task management response code as a readable
+ * string.
  *
- * Return: Nothing.
+ * Return: response code string.
  */
-static void mpi3mr_print_response_code(struct mpi3mr_ioc *mrioc, u8 resp_code)
+static const char *mpi3mr_tm_response_name(u8 resp_code)
 {
 	char *desc;
 
 	switch (resp_code) {
-	case MPI3MR_RSP_TM_COMPLETE:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_COMPLETE:
 		desc = "task management request completed";
 		break;
-	case MPI3MR_RSP_INVALID_FRAME:
+	case MPI3_SCSITASKMGMT_RSPCODE_INVALID_FRAME:
 		desc = "invalid frame";
 		break;
-	case MPI3MR_RSP_TM_NOT_SUPPORTED:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_FUNCTION_NOT_SUPPORTED:
 		desc = "task management request not supported";
 		break;
-	case MPI3MR_RSP_TM_FAILED:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_FAILED:
 		desc = "task management request failed";
 		break;
-	case MPI3MR_RSP_TM_SUCCEEDED:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_SUCCEEDED:
 		desc = "task management request succeeded";
 		break;
-	case MPI3MR_RSP_TM_INVALID_LUN:
-		desc = "invalid lun";
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_INVALID_LUN:
+		desc = "invalid LUN";
 		break;
-	case MPI3MR_RSP_TM_OVERLAPPED_TAG:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_OVERLAPPED_TAG:
 		desc = "overlapped tag attempted";
 		break;
-	case MPI3MR_RSP_IO_QUEUED_ON_IOC:
+	case MPI3_SCSITASKMGMT_RSPCODE_IO_QUEUED_ON_IOC:
 		desc = "task queued, however not sent to target";
+		break;
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_NVME_DENIED:
+		desc = "task management request denied by NVMe device";
 		break;
 	default:
 		desc = "unknown";
 		break;
 	}
-	ioc_info(mrioc, "%s :response_code(0x%01x): %s\n", __func__,
-	    resp_code, desc);
+
+	return desc;
+}
+
+inline void mpi3mr_poll_pend_io_completions(struct mpi3mr_ioc *mrioc)
+{
+	int i;
+	int num_of_reply_queues =
+	    mrioc->num_op_reply_q + mrioc->op_reply_q_offset;
+
+	for (i = mrioc->op_reply_q_offset; i < num_of_reply_queues; i++)
+		mpi3mr_process_op_reply_q(mrioc,
+		    mrioc->intr_info[i].op_reply_q);
 }
 
 /**
@@ -2879,9 +2961,10 @@ static void mpi3mr_print_response_code(struct mpi3mr_ioc *mrioc, u8 resp_code)
  * @handle: Device handle
  * @lun: lun ID
  * @htag: Host tag of the TM request
+ * @timeout: TM timeout value
  * @drv_cmd: Internal command tracker
  * @resp_code: Response code place holder
- * @cmd_priv: SCSI command private data
+ * @scmd: SCSI command
  *
  * Issues a Task Management Request to the controller for a
  * specified target, lun and command and wait for its completion
@@ -2893,21 +2976,21 @@ static void mpi3mr_print_response_code(struct mpi3mr_ioc *mrioc, u8 resp_code)
 static int mpi3mr_issue_tm(struct mpi3mr_ioc *mrioc, u8 tm_type,
 	u16 handle, uint lun, u16 htag, ulong timeout,
 	struct mpi3mr_drv_cmd *drv_cmd,
-	u8 *resp_code, struct scmd_priv *cmd_priv)
+	u8 *resp_code, struct scsi_cmnd *scmd)
 {
 	struct mpi3_scsi_task_mgmt_request tm_req;
 	struct mpi3_scsi_task_mgmt_reply *tm_reply = NULL;
 	int retval = 0;
 	struct mpi3mr_tgt_dev *tgtdev = NULL;
 	struct mpi3mr_stgt_priv_data *scsi_tgt_priv_data = NULL;
-	struct op_req_qinfo *op_req_q = NULL;
+	struct scmd_priv *cmd_priv = NULL;
+	struct scsi_device *sdev = NULL;
+	struct mpi3mr_sdev_priv_data *sdev_priv_data = NULL;
 
-	ioc_info(mrioc, "%s :Issue TM: TM type (0x%x) for devhandle 0x%04x\n",
-	     __func__, tm_type, handle);
 	if (mrioc->unrecoverable) {
 		retval = -1;
-		ioc_err(mrioc, "%s :Issue TM: Unrecoverable controller\n",
-		    __func__);
+		dprint_tm(mrioc,
+		    "sending task management failed due to  unrecoverable controller\n");
 		goto out;
 	}
 
@@ -2915,13 +2998,13 @@ static int mpi3mr_issue_tm(struct mpi3mr_ioc *mrioc, u8 tm_type,
 	mutex_lock(&drv_cmd->mutex);
 	if (drv_cmd->state & MPI3MR_CMD_PENDING) {
 		retval = -1;
-		ioc_err(mrioc, "%s :Issue TM: Command is in use\n", __func__);
+		dprint_tm(mrioc, "sending task management failed due to command in use\n");
 		mutex_unlock(&drv_cmd->mutex);
 		goto out;
 	}
 	if (mrioc->reset_in_progress) {
 		retval = -1;
-		ioc_err(mrioc, "%s :Issue TM: Reset in progress\n", __func__);
+		dprint_tm(mrioc, "sending task management failed due to controller reset\n");
 		mutex_unlock(&drv_cmd->mutex);
 		goto out;
 	}
@@ -2937,16 +3020,21 @@ static int mpi3mr_issue_tm(struct mpi3mr_ioc *mrioc, u8 tm_type,
 	tm_req.function = MPI3_FUNCTION_SCSI_TASK_MGMT;
 
 	tgtdev = mpi3mr_get_tgtdev_by_handle(mrioc, handle);
-	if (tgtdev && tgtdev->starget && tgtdev->starget->hostdata) {
-		scsi_tgt_priv_data = (struct mpi3mr_stgt_priv_data *)
-		    tgtdev->starget->hostdata;
+
+	if (scmd) {
+		sdev = scmd->device;
+		sdev_priv_data = sdev->hostdata;
+		scsi_tgt_priv_data = ((sdev_priv_data) ?
+		    sdev_priv_data->tgt_priv_data : NULL);
+	} else {
+		if (tgtdev && tgtdev->starget && tgtdev->starget->hostdata)
+			scsi_tgt_priv_data = (struct mpi3mr_stgt_priv_data *)
+			    tgtdev->starget->hostdata;
+	}
+
+	if (scsi_tgt_priv_data)
 		atomic_inc(&scsi_tgt_priv_data->block_io);
-	}
-	if (cmd_priv) {
-		op_req_q = &mrioc->req_qinfo[cmd_priv->req_q_idx];
-		tm_req.task_host_tag = cpu_to_le16(cmd_priv->host_tag);
-		tm_req.task_request_queue_id = cpu_to_le16(op_req_q->qid);
-	}
+
 	if (tgtdev && (tgtdev->dev_type == MPI3_DEVICE_DEVFORM_PCIE)) {
 		if (cmd_priv && tgtdev->dev_spec.pcie_inf.abort_to)
 			timeout = tgtdev->dev_spec.pcie_inf.abort_to;
@@ -2954,49 +3042,60 @@ static int mpi3mr_issue_tm(struct mpi3mr_ioc *mrioc, u8 tm_type,
 			timeout = tgtdev->dev_spec.pcie_inf.reset_to;
 	}
 
+	dprint_tm(mrioc, "posting task management request: type(%d), handle(0x%04x)\n",
+	    tm_type, handle);
 	init_completion(&drv_cmd->done);
 	retval = mpi3mr_admin_request_post(mrioc, &tm_req, sizeof(tm_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "%s :Issue TM: Admin Post failed\n", __func__);
+		dprint_tm(mrioc, "posting task management request is failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&drv_cmd->done, (timeout * HZ));
 
 	if (!(drv_cmd->state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "%s :Issue TM: command timed out\n", __func__);
 		drv_cmd->is_waiting = 0;
 		retval = -1;
-		if (!(drv_cmd->state & MPI3MR_CMD_RESET))
+		if (!(drv_cmd->state & MPI3MR_CMD_RESET)) {
+			dprint_tm(mrioc,
+			    "task management request timed out after %ld seconds\n",
+			    timeout);
+			if (mrioc->logging_level & MPI3_DEBUG_TM)
+				dprint_dump_req(&tm_req, sizeof(tm_req)/4);
 			mpi3mr_soft_reset_handler(mrioc,
 			    MPI3MR_RESET_FROM_TM_TIMEOUT, 1);
+		}
 		goto out_unlock;
 	}
 
-	if (drv_cmd->state & MPI3MR_CMD_REPLY_VALID)
-		tm_reply = (struct mpi3_scsi_task_mgmt_reply *)drv_cmd->reply;
-
-	if (drv_cmd->ioc_status != MPI3_IOCSTATUS_SUCCESS) {
-		ioc_err(mrioc,
-		    "%s :Issue TM: handle(0x%04x) Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
-		    __func__, handle, drv_cmd->ioc_status,
-		    drv_cmd->ioc_loginfo);
+	if (!(drv_cmd->state & MPI3MR_CMD_REPLY_VALID)) {
+		dprint_tm(mrioc, "invalid task management reply message\n");
 		retval = -1;
 		goto out_unlock;
 	}
 
-	if (!tm_reply) {
-		ioc_err(mrioc, "%s :Issue TM: No TM Reply message\n", __func__);
-		retval = -1;
-		goto out_unlock;
-	}
+	tm_reply = (struct mpi3_scsi_task_mgmt_reply *)drv_cmd->reply;
 
-	*resp_code = le32_to_cpu(tm_reply->response_data) &
-	    MPI3MR_RI_MASK_RESPCODE;
-	switch (*resp_code) {
-	case MPI3MR_RSP_TM_SUCCEEDED:
-	case MPI3MR_RSP_TM_COMPLETE:
+	switch (drv_cmd->ioc_status) {
+	case MPI3_IOCSTATUS_SUCCESS:
+		*resp_code = le32_to_cpu(tm_reply->response_data) &
+			MPI3MR_RI_MASK_RESPCODE;
 		break;
-	case MPI3MR_RSP_IO_QUEUED_ON_IOC:
+	case MPI3_IOCSTATUS_SCSI_IOC_TERMINATED:
+		*resp_code = MPI3_SCSITASKMGMT_RSPCODE_TM_COMPLETE;
+		break;
+	default:
+		dprint_tm(mrioc,
+		    "task management request to handle(0x%04x) is failed with ioc_status(0x%04x) log_info(0x%08x)\n",
+		    handle, drv_cmd->ioc_status, drv_cmd->ioc_loginfo);
+		retval = -1;
+		goto out_unlock;
+	}
+
+	switch (*resp_code) {
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_SUCCEEDED:
+	case MPI3_SCSITASKMGMT_RSPCODE_TM_COMPLETE:
+		break;
+	case MPI3_SCSITASKMGMT_RSPCODE_IO_QUEUED_ON_IOC:
 		if (tm_type != MPI3_SCSITASKMGMT_TASKTYPE_QUERY_TASK)
 			retval = -1;
 		break;
@@ -3005,14 +3104,37 @@ static int mpi3mr_issue_tm(struct mpi3mr_ioc *mrioc, u8 tm_type,
 		break;
 	}
 
-	ioc_info(mrioc,
-	    "%s :Issue TM: Completed TM type (0x%x) handle(0x%04x) ",
-	    __func__, tm_type, handle);
-	ioc_info(mrioc,
-	    "with ioc_status(0x%04x), loginfo(0x%08x), term_count(0x%08x)\n",
-	    drv_cmd->ioc_status, drv_cmd->ioc_loginfo,
-	    le32_to_cpu(tm_reply->termination_count));
-	mpi3mr_print_response_code(mrioc, *resp_code);
+	dprint_tm(mrioc,
+	    "task management request type(%d) completed for handle(0x%04x) with ioc_status(0x%04x), log_info(0x%08x), termination_count(%d), response:%s(0x%x)\n",
+	    tm_type, handle, drv_cmd->ioc_status, drv_cmd->ioc_loginfo,
+	    le32_to_cpu(tm_reply->termination_count),
+	    mpi3mr_tm_response_name(*resp_code), *resp_code);
+
+	if (!retval) {
+		mpi3mr_ioc_disable_intr(mrioc);
+		mpi3mr_poll_pend_io_completions(mrioc);
+		mpi3mr_ioc_enable_intr(mrioc);
+		mpi3mr_poll_pend_io_completions(mrioc);
+	}
+	switch (tm_type) {
+	case MPI3_SCSITASKMGMT_TASKTYPE_TARGET_RESET:
+		if (!scsi_tgt_priv_data)
+			break;
+		scsi_tgt_priv_data->pend_count = 0;
+		blk_mq_tagset_busy_iter(&mrioc->shost->tag_set,
+		    mpi3mr_count_tgt_pending,
+		    (void *)scsi_tgt_priv_data->starget);
+		break;
+	case MPI3_SCSITASKMGMT_TASKTYPE_LOGICAL_UNIT_RESET:
+		if (!sdev_priv_data)
+			break;
+		sdev_priv_data->pend_count = 0;
+		blk_mq_tagset_busy_iter(&mrioc->shost->tag_set,
+		    mpi3mr_count_dev_pending, (void *)sdev);
+		break;
+	default:
+		break;
+	}
 
 out_unlock:
 	drv_cmd->state = MPI3MR_CMD_NOTUSED;
@@ -3021,14 +3143,6 @@ out_unlock:
 		atomic_dec_if_positive(&scsi_tgt_priv_data->block_io);
 	if (tgtdev)
 		mpi3mr_tgtdev_put(tgtdev);
-	if (!retval) {
-		/*
-		 * Flush all IRQ handlers by calling synchronize_irq().
-		 * mpi3mr_ioc_disable_intr() takes care of it.
-		 */
-		mpi3mr_ioc_disable_intr(mrioc);
-		mpi3mr_ioc_enable_intr(mrioc);
-	}
 out:
 	return retval;
 }
@@ -3256,36 +3370,52 @@ static int mpi3mr_eh_target_reset(struct scsi_cmnd *scmd)
 	u8 resp_code = 0;
 	int retval = FAILED, ret = 0;
 
+
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Attempting Target Reset! scmd(%p)\n", scmd);
+	    "%s: attempting target reset! scmd(%p)\n", mrioc->name, scmd);
 	scsi_print_command(scmd);
 
 	sdev_priv_data = scmd->device->hostdata;
 	if (!sdev_priv_data || !sdev_priv_data->tgt_priv_data) {
 		sdev_printk(KERN_INFO, scmd->device,
-		    "SCSI device is not available\n");
+		    "%s: target is not available, target reset  is not issued\n",
+		    mrioc->name);
 		retval = SUCCESS;
 		goto out;
 	}
 
 	stgt_priv_data = sdev_priv_data->tgt_priv_data;
 	dev_handle = stgt_priv_data->dev_handle;
+	if (stgt_priv_data->dev_removed) {
+		sdev_printk(KERN_INFO, scmd->device,
+		    "%s:target(handle = 0x%04x) is removed, target reset is not issued\n",
+		    mrioc->name, dev_handle);
+		retval = FAILED;
+		goto out;
+	}
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Target Reset is issued to handle(0x%04x)\n",
-	    dev_handle);
+	    "%s: target reset is issued to handle(0x%04x)\n",
+	    mrioc->name, dev_handle);
 
 	ret = mpi3mr_issue_tm(mrioc,
 	    MPI3_SCSITASKMGMT_TASKTYPE_TARGET_RESET, dev_handle,
 	    sdev_priv_data->lun_id, MPI3MR_HOSTTAG_BLK_TMS,
-	    MPI3MR_RESETTM_TIMEOUT, &mrioc->host_tm_cmds, &resp_code, NULL);
+	    MPI3MR_RESETTM_TIMEOUT, &mrioc->host_tm_cmds, &resp_code, scmd);
 
 	if (ret)
 		goto out;
 
+	if (stgt_priv_data->pend_count) {
+		sdev_printk(KERN_INFO, scmd->device,
+		    "%s: target has %d pending commands, target reset is failed\n",
+		    mrioc->name, sdev_priv_data->pend_count);
+		goto out;
+	}
+
 	retval = SUCCESS;
 out:
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Target reset is %s for scmd(%p)\n",
+	    "%s: target reset is %s for scmd(%p)\n", mrioc->name,
 	    ((retval == SUCCESS) ? "SUCCESS" : "FAILED"), scmd);
 
 	return retval;
@@ -3311,34 +3441,49 @@ static int mpi3mr_eh_dev_reset(struct scsi_cmnd *scmd)
 	int retval = FAILED, ret = 0;
 
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Attempting Device(lun) Reset! scmd(%p)\n", scmd);
+	    "%s: attempting device(LUN) reset! scmd(%p)\n", mrioc->name, scmd);
 	scsi_print_command(scmd);
 
 	sdev_priv_data = scmd->device->hostdata;
 	if (!sdev_priv_data || !sdev_priv_data->tgt_priv_data) {
 		sdev_printk(KERN_INFO, scmd->device,
-		    "SCSI device is not available\n");
+		    "%s: device is not available, device(LUN) reset  is not issued\n",
+		    mrioc->name);
 		retval = SUCCESS;
 		goto out;
 	}
 
 	stgt_priv_data = sdev_priv_data->tgt_priv_data;
 	dev_handle = stgt_priv_data->dev_handle;
+	if (stgt_priv_data->dev_removed) {
+		sdev_printk(KERN_INFO, scmd->device,
+		    "%s: device(handle = 0x%04x) is removed, device(LUN) reset is not issued\n",
+		    mrioc->name, dev_handle);
+		retval = FAILED;
+		goto out;
+	}
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Device(lun) Reset is issued to handle(0x%04x)\n", dev_handle);
+	    "%s: device(LUN) reset is issued to handle(0x%04x)\n",
+	    mrioc->name, dev_handle);
 
 	ret = mpi3mr_issue_tm(mrioc,
 	    MPI3_SCSITASKMGMT_TASKTYPE_LOGICAL_UNIT_RESET, dev_handle,
 	    sdev_priv_data->lun_id, MPI3MR_HOSTTAG_BLK_TMS,
-	    MPI3MR_RESETTM_TIMEOUT, &mrioc->host_tm_cmds, &resp_code, NULL);
+	    MPI3MR_RESETTM_TIMEOUT, &mrioc->host_tm_cmds, &resp_code, scmd);
 
 	if (ret)
 		goto out;
 
+	if (sdev_priv_data->pend_count) {
+		sdev_printk(KERN_INFO, scmd->device,
+		    "%s: device has %d pending commands, device(LUN) reset is failed\n",
+		    mrioc->name, sdev_priv_data->pend_count);
+		goto out;
+	}
 	retval = SUCCESS;
 out:
 	sdev_printk(KERN_INFO, scmd->device,
-	    "Device(lun) reset is %s for scmd(%p)\n",
+	    "%s: device(LUN) reset is %s for scmd(%p)\n", mrioc->name,
 	    ((retval == SUCCESS) ? "SUCCESS" : "FAILED"), scmd);
 
 	return retval;
