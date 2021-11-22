@@ -34,6 +34,9 @@ MODULE_PARM_DESC(logging_level,
 	" bits for enabling additional logging info (default=0)");
 
 /* Forward declarations*/
+static void mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
+	struct mpi3mr_drv_cmd *cmdparam, u32 event_ctx);
+
 /**
  * mpi3mr_host_tag_for_scmd - Get host tag for a scmd
  * @mrioc: Adapter instance reference
@@ -1336,7 +1339,7 @@ static void mpi3mr_fwevt_bh(struct mpi3mr_ioc *mrioc,
 
 evt_ack:
 	if (fwevt->send_ack)
-		mpi3mr_send_event_ack(mrioc, fwevt->event_id,
+		mpi3mr_process_event_ack(mrioc, fwevt->event_id,
 		    fwevt->evt_ctx);
 out:
 	/* Put fwevt reference count to neutralize kref_init increment */
@@ -1403,20 +1406,29 @@ static int mpi3mr_create_tgtdev(struct mpi3mr_ioc *mrioc,
  * mpi3mr_flush_delayed_cmd_lists - Flush pending commands
  * @mrioc: Adapter instance reference
  *
- * Flush pending commands in the delayed removal handshake list
- * due to a controller reset or driver removal as a cleanup.
+ * Flush pending commands in the delayed lists due to a
+ * controller reset or driver removal as a cleanup.
  *
  * Return: Nothing
  */
 void mpi3mr_flush_delayed_cmd_lists(struct mpi3mr_ioc *mrioc)
 {
 	struct delayed_dev_rmhs_node *_rmhs_node;
+	struct delayed_evt_ack_node *_evtack_node;
 
+	dprint_reset(mrioc, "flushing delayed dev_remove_hs commands\n");
 	while (!list_empty(&mrioc->delayed_rmhs_list)) {
 		_rmhs_node = list_entry(mrioc->delayed_rmhs_list.next,
 		    struct delayed_dev_rmhs_node, list);
 		list_del(&_rmhs_node->list);
 		kfree(_rmhs_node);
+	}
+	dprint_reset(mrioc, "flushing delayed event ack commands\n");
+	while (!list_empty(&mrioc->delayed_evtack_cmds_list)) {
+		_evtack_node = list_entry(mrioc->delayed_evtack_cmds_list.next,
+		    struct delayed_evt_ack_node, list);
+		list_del(&_evtack_node->list);
+		kfree(_evtack_node);
 	}
 }
 
@@ -1634,6 +1646,141 @@ out_failed:
 }
 
 /**
+ * mpi3mr_complete_evt_ack - event ack request completion
+ * @mrioc: Adapter instance reference
+ * @drv_cmd: Internal command tracker
+ *
+ * This is the completion handler for non blocking event
+ * acknowledgment sent to the firmware and this will issue any
+ * pending event acknowledgment request.
+ *
+ * Return: Nothing
+ */
+static void mpi3mr_complete_evt_ack(struct mpi3mr_ioc *mrioc,
+	struct mpi3mr_drv_cmd *drv_cmd)
+{
+	u16 cmd_idx = drv_cmd->host_tag - MPI3MR_HOSTTAG_EVTACKCMD_MIN;
+	struct delayed_evt_ack_node *delayed_evtack = NULL;
+
+	if (drv_cmd->ioc_status != MPI3_IOCSTATUS_SUCCESS) {
+		dprint_event_th(mrioc,
+		    "immediate event ack failed with ioc_status(0x%04x) log_info(0x%08x)\n",
+		    (drv_cmd->ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
+		    drv_cmd->ioc_loginfo);
+	}
+
+	if (!list_empty(&mrioc->delayed_evtack_cmds_list)) {
+		delayed_evtack =
+			list_entry(mrioc->delayed_evtack_cmds_list.next,
+			    struct delayed_evt_ack_node, list);
+		mpi3mr_send_event_ack(mrioc, delayed_evtack->event, drv_cmd,
+		    delayed_evtack->event_ctx);
+		list_del(&delayed_evtack->list);
+		kfree(delayed_evtack);
+		return;
+	}
+	drv_cmd->state = MPI3MR_CMD_NOTUSED;
+	drv_cmd->callback = NULL;
+	clear_bit(cmd_idx, mrioc->evtack_cmds_bitmap);
+}
+
+/**
+ * mpi3mr_send_event_ack - Issue event acknwoledgment request
+ * @mrioc: Adapter instance reference
+ * @event: MPI3 event id
+ * @cmdparam: Internal command tracker
+ * @event_ctx: event context
+ *
+ * Issues event acknowledgment request to the firmware if there
+ * is a free command to send the event ack else it to a pend
+ * list so that it will be processed on a completion of a prior
+ * event acknowledgment .
+ *
+ * Return: Nothing
+ */
+static void mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
+	struct mpi3mr_drv_cmd *cmdparam, u32 event_ctx)
+{
+	struct mpi3_event_ack_request evtack_req;
+	int retval = 0;
+	u8 retrycount = 5;
+	u16 cmd_idx = MPI3MR_NUM_EVTACKCMD;
+	struct mpi3mr_drv_cmd *drv_cmd = cmdparam;
+	struct delayed_evt_ack_node *delayed_evtack = NULL;
+
+	if (drv_cmd) {
+		dprint_event_th(mrioc,
+		    "sending delayed event ack in the top half for event(0x%02x), event_ctx(0x%08x)\n",
+		    event, event_ctx);
+		goto issue_cmd;
+	}
+	dprint_event_th(mrioc,
+	    "sending event ack in the top half for event(0x%02x), event_ctx(0x%08x)\n",
+	    event, event_ctx);
+	do {
+		cmd_idx = find_first_zero_bit(mrioc->evtack_cmds_bitmap,
+		    MPI3MR_NUM_EVTACKCMD);
+		if (cmd_idx < MPI3MR_NUM_EVTACKCMD) {
+			if (!test_and_set_bit(cmd_idx,
+			    mrioc->evtack_cmds_bitmap))
+				break;
+			cmd_idx = MPI3MR_NUM_EVTACKCMD;
+		}
+	} while (retrycount--);
+
+	if (cmd_idx >= MPI3MR_NUM_EVTACKCMD) {
+		delayed_evtack = kzalloc(sizeof(*delayed_evtack),
+		    GFP_ATOMIC);
+		if (!delayed_evtack)
+			return;
+		INIT_LIST_HEAD(&delayed_evtack->list);
+		delayed_evtack->event = event;
+		delayed_evtack->event_ctx = event_ctx;
+		list_add_tail(&delayed_evtack->list,
+		    &mrioc->delayed_evtack_cmds_list);
+		dprint_event_th(mrioc,
+		    "event ack in the top half for event(0x%02x), event_ctx(0x%08x) is postponed\n",
+		    event, event_ctx);
+		return;
+	}
+	drv_cmd = &mrioc->evtack_cmds[cmd_idx];
+
+issue_cmd:
+	cmd_idx = drv_cmd->host_tag - MPI3MR_HOSTTAG_EVTACKCMD_MIN;
+
+	memset(&evtack_req, 0, sizeof(evtack_req));
+	if (drv_cmd->state & MPI3MR_CMD_PENDING) {
+		dprint_event_th(mrioc,
+		    "sending event ack failed due to command in use\n");
+		goto out;
+	}
+	drv_cmd->state = MPI3MR_CMD_PENDING;
+	drv_cmd->is_waiting = 0;
+	drv_cmd->callback = mpi3mr_complete_evt_ack;
+	evtack_req.host_tag = cpu_to_le16(drv_cmd->host_tag);
+	evtack_req.function = MPI3_FUNCTION_EVENT_ACK;
+	evtack_req.event = event;
+	evtack_req.event_context = cpu_to_le32(event_ctx);
+	retval = mpi3mr_admin_request_post(mrioc, &evtack_req,
+	    sizeof(evtack_req), 1);
+	if (retval) {
+		dprint_event_th(mrioc,
+		    "posting event ack request is failed\n");
+		goto out_failed;
+	}
+
+	dprint_event_th(mrioc,
+	    "event ack in the top half for event(0x%02x), event_ctx(0x%08x) is posted\n",
+	    event, event_ctx);
+out:
+	return;
+out_failed:
+	drv_cmd->state = MPI3MR_CMD_NOTUSED;
+	drv_cmd->callback = NULL;
+	clear_bit(cmd_idx, mrioc->evtack_cmds_bitmap);
+}
+
+/**
  * mpi3mr_pcietopochg_evt_th - PCIETopologyChange evt tophalf
  * @mrioc: Adapter instance reference
  * @event_reply: event data
@@ -1842,6 +1989,40 @@ out:
 }
 
 /**
+ * mpi3mr_preparereset_evt_th - Prepare for reset event tophalf
+ * @mrioc: Adapter instance reference
+ * @event_reply: event data
+ *
+ * Blocks and unblocks host level I/O based on the reason code
+ *
+ * Return: Nothing
+ */
+static void mpi3mr_preparereset_evt_th(struct mpi3mr_ioc *mrioc,
+	struct mpi3_event_notification_reply *event_reply)
+{
+	struct mpi3_event_data_prepare_for_reset *evtdata =
+	    (struct mpi3_event_data_prepare_for_reset *)event_reply->event_data;
+
+	if (evtdata->reason_code == MPI3_EVENT_PREPARE_RESET_RC_START) {
+		dprint_event_th(mrioc,
+		    "prepare for reset event top half with rc=start\n");
+		if (mrioc->prepare_for_reset)
+			return;
+		mrioc->prepare_for_reset = 1;
+		mrioc->prepare_for_reset_timeout_counter = 0;
+	} else if (evtdata->reason_code == MPI3_EVENT_PREPARE_RESET_RC_ABORT) {
+		dprint_event_th(mrioc,
+		    "prepare for reset top half with rc=abort\n");
+		mrioc->prepare_for_reset = 0;
+		mrioc->prepare_for_reset_timeout_counter = 0;
+	}
+	if ((event_reply->msg_flags & MPI3_EVENT_NOTIFY_MSGFLAGS_ACK_MASK)
+	    == MPI3_EVENT_NOTIFY_MSGFLAGS_ACK_REQUIRED)
+		mpi3mr_send_event_ack(mrioc, event_reply->event, NULL,
+		    le32_to_cpu(event_reply->event_context));
+}
+
+/**
  * mpi3mr_energypackchg_evt_th - Energy pack change evt tophalf
  * @mrioc: Adapter instance reference
  * @event_reply: event data
@@ -1926,6 +2107,12 @@ void mpi3mr_os_handle_events(struct mpi3mr_ioc *mrioc,
 	{
 		process_evt_bh = 1;
 		mpi3mr_pcietopochg_evt_th(mrioc, event_reply);
+		break;
+	}
+	case MPI3_EVENT_PREPARE_FOR_RESET:
+	{
+		mpi3mr_preparereset_evt_th(mrioc, event_reply);
+		ack_req = 0;
 		break;
 	}
 	case MPI3_EVENT_DEVICE_INFO_CHANGED:
@@ -3775,6 +3962,7 @@ mpi3mr_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_LIST_HEAD(&mrioc->fwevt_list);
 	INIT_LIST_HEAD(&mrioc->tgtdev_list);
 	INIT_LIST_HEAD(&mrioc->delayed_rmhs_list);
+	INIT_LIST_HEAD(&mrioc->delayed_evtack_cmds_list);
 
 	mutex_init(&mrioc->reset_mutex);
 	mpi3mr_init_drv_cmd(&mrioc->init_cmds, MPI3MR_HOSTTAG_INITCMDS);
