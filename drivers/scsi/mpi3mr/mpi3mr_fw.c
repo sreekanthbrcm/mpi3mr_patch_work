@@ -1408,26 +1408,22 @@ static int mpi3mr_delete_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 	retval = mpi3mr_admin_request_post(mrioc, &delq_req, sizeof(delq_req),
 	    1);
 	if (retval) {
-		ioc_err(mrioc, "Issue DelRepQ: Admin Post failed\n");
+		ioc_err(mrioc, "posting delete reply queue failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "Issue DelRepQ: command timed out\n");
-		mpi3mr_set_diagsave(mrioc);
-		mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+		ioc_err(mrioc, "delete reply queue timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
 		    MPI3MR_RESET_FROM_DELREPQ_TIMEOUT);
-		mrioc->unrecoverable = 1;
-
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "Issue DelRepQ: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "delete reply queue returned with ioc_status(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -1634,25 +1630,22 @@ static int mpi3mr_create_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 	retval = mpi3mr_admin_request_post(mrioc, &create_req,
 	    sizeof(create_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "CreateRepQ: Admin Post failed\n");
+		ioc_err(mrioc, "posting create reply queue failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "CreateRepQ: command timed out\n");
-		mpi3mr_set_diagsave(mrioc);
-		mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+		ioc_err(mrioc, "create reply queue timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
 		    MPI3MR_RESET_FROM_CREATEREPQ_TIMEOUT);
-		mrioc->unrecoverable = 1;
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "CreateRepQ: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "create reply queue returned with ioc_status(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -1741,25 +1734,22 @@ static int mpi3mr_create_op_req_q(struct mpi3mr_ioc *mrioc, u16 idx,
 	retval = mpi3mr_admin_request_post(mrioc, &create_req,
 	    sizeof(create_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "CreateReqQ: Admin Post failed\n");
+		ioc_err(mrioc, "posting create request queue failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "CreateReqQ: command timed out\n");
-		mpi3mr_set_diagsave(mrioc);
-		if (mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
-		    MPI3MR_RESET_FROM_CREATEREQQ_TIMEOUT))
-			mrioc->unrecoverable = 1;
+		ioc_err(mrioc, "create request queue timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
+		    MPI3MR_RESET_FROM_CREATEREQQ_TIMEOUT);
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "CreateReqQ: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "create request queue returned with ioc_status(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -1926,6 +1916,42 @@ out:
 }
 
 /**
+ * mpi3mr_check_rh_fault_ioc - check reset history and fault
+ * controller
+ * @mrioc: Adapter instance reference
+ * @reason_code, reason code for the fault.
+ *
+ * This routine will save snapdump and fault the controller with
+ * the given reason code if it is not already in the fault or
+ * not asynchronosuly reset. This will be used to handle
+ * initilaization time faults/resets/timeout as in those cases
+ * immediate soft reset invocation is not required.
+ *
+ * Return:  None.
+ */
+void mpi3mr_check_rh_fault_ioc(struct mpi3mr_ioc *mrioc, u32 reason_code)
+{
+	u32 ioc_status, host_diagnostic, timeout;
+
+	ioc_status = readl(&mrioc->sysif_regs->ioc_status);
+	if ((ioc_status & MPI3_SYSIF_IOC_STATUS_RESET_HISTORY) ||
+	    (ioc_status & MPI3_SYSIF_IOC_STATUS_FAULT)) {
+		mpi3mr_print_fault_info(mrioc);
+		return;
+	}
+	mpi3mr_set_diagsave(mrioc);
+	mpi3mr_issue_reset(mrioc, MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+	    reason_code);
+	timeout = MPI3_SYSIF_DIAG_SAVE_TIMEOUT * 10;
+	do {
+		host_diagnostic = readl(&mrioc->sysif_regs->host_diagnostic);
+		if (!(host_diagnostic & MPI3_SYSIF_HOST_DIAG_SAVE_IN_PROGRESS))
+			break;
+		msleep(100);
+	} while (--timeout);
+}
+
+/**
  * mpi3mr_sync_timestamp - Issue time stamp sync request
  * @mrioc: Adapter reference
  *
@@ -2047,6 +2073,8 @@ static int mpi3mr_print_pkg_ver(struct mpi3mr_ioc *mrioc)
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
 		ioc_err(mrioc, "get package version timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
+		    MPI3MR_RESET_FROM_GETPKGVER_TIMEOUT);
 		retval = -1;
 		goto out_unlock;
 	}
@@ -2359,25 +2387,22 @@ static int mpi3mr_issue_iocfacts(struct mpi3mr_ioc *mrioc,
 	retval = mpi3mr_admin_request_post(mrioc, &iocfacts_req,
 	    sizeof(iocfacts_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "Issue IOCFacts: Admin Post failed\n");
+		ioc_err(mrioc, "posting ioc_facts request failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "Issue IOCFacts: command timed out\n");
-		mpi3mr_set_diagsave(mrioc);
-		mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+		ioc_err(mrioc, "ioc_facts timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
 		    MPI3MR_RESET_FROM_IOCFACTS_TIMEOUT);
-		mrioc->unrecoverable = 1;
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "Issue IOCFacts: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "ioc_facts returned with ioc_status(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -2758,25 +2783,22 @@ static int mpi3mr_issue_iocinit(struct mpi3mr_ioc *mrioc)
 	retval = mpi3mr_admin_request_post(mrioc, &iocinit_req,
 	    sizeof(iocinit_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "Issue IOCInit: Admin Post failed\n");
+		ioc_err(mrioc, "posting ioc_init failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		mpi3mr_set_diagsave(mrioc);
-		mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+		mpi3mr_check_rh_fault_ioc(mrioc,
 		    MPI3MR_RESET_FROM_IOCINIT_TIMEOUT);
-		mrioc->unrecoverable = 1;
-		ioc_err(mrioc, "Issue IOCInit: command timed out\n");
+		ioc_err(mrioc, "ioc_init timed out\n");
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "Issue IOCInit: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "ioc_init returned with ioc_status(0x%04x) log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -2854,25 +2876,22 @@ static int mpi3mr_issue_event_notification(struct mpi3mr_ioc *mrioc)
 	retval = mpi3mr_admin_request_post(mrioc, &evtnotify_req,
 	    sizeof(evtnotify_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "Issue EvtNotify: Admin Post failed\n");
+		ioc_err(mrioc, "posting event notification failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "Issue EvtNotify: command timed out\n");
-		mpi3mr_set_diagsave(mrioc);
-		mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+		ioc_err(mrioc, "event notification timed out\n");
+		mpi3mr_check_rh_fault_ioc(mrioc,
 		    MPI3MR_RESET_FROM_EVTNOTIFY_TIMEOUT);
-		mrioc->unrecoverable = 1;
 		retval = -1;
 		goto out_unlock;
 	}
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "Issue EvtNotify: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "event notification returned with ioc_tatus(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -3069,32 +3088,31 @@ int mpi3mr_issue_port_enable(struct mpi3mr_ioc *mrioc, u8 async)
 
 	retval = mpi3mr_admin_request_post(mrioc, &pe_req, sizeof(pe_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "Issue PortEnable: Admin Post failed\n");
+		ioc_err(mrioc, "posting port enable failed\n");
 		goto out_unlock;
 	}
-	if (!async) {
-		wait_for_completion_timeout(&mrioc->init_cmds.done,
-		    (pe_timeout * HZ));
-		if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-			ioc_err(mrioc, "Issue PortEnable: command timed out\n");
-			retval = -1;
-			mrioc->scan_failed = MPI3_IOCSTATUS_INTERNAL_ERROR;
-			mpi3mr_set_diagsave(mrioc);
-			mpi3mr_issue_reset(mrioc,
-			    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
-			    MPI3MR_RESET_FROM_PE_TIMEOUT);
-			mrioc->unrecoverable = 1;
-			goto out_unlock;
-		}
-		mpi3mr_port_enable_complete(mrioc, &mrioc->init_cmds);
+	if (async) {
+		mutex_unlock(&mrioc->init_cmds.mutex);
+		goto out;
 	}
+
+	wait_for_completion_timeout(&mrioc->init_cmds.done, (pe_timeout * HZ));
+	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
+		ioc_err(mrioc, "port enable timed out\n");
+		retval = -1;
+		mpi3mr_check_rh_fault_ioc(mrioc, MPI3MR_RESET_FROM_PE_TIMEOUT);
+		goto out_unlock;
+	}
+	mpi3mr_port_enable_complete(mrioc, &mrioc->init_cmds);
+
 out_unlock:
+	mrioc->init_cmds.state = MPI3MR_CMD_NOTUSED;
 	mutex_unlock(&mrioc->init_cmds.mutex);
 out:
 	return retval;
 }
 
-/* Protocol type to name mapper structure*/
+/* Protocol type to name mapper structure */
 static const struct {
 	u8 protocol;
 	char *name;
