@@ -8,20 +8,43 @@
  */
 
 #include "mpi3mr.h"
-#include <linux/io-64-nonatomic-lo-hi.h>
 
 #if defined(writeq) && defined(CONFIG_64BIT)
-static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr)
+static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
+	spinlock_t *write_queue_lock)
 {
 	writeq(b, addr);
 }
 #else
-static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr)
+static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
+	spinlock_t *write_queue_lock)
 {
 	__u64 data_out = b;
+	unsigned long flags;
+
+	spin_lock_irqsave(write_queue_lock, flags);
 
 	writel((u32)(data_out), addr);
 	writel((u32)(data_out >> 32), (addr + 4));
+
+	spin_unlock_irqrestore(write_queue_lock, flags);
+}
+#endif
+
+#if defined(readq) && defined(CONFIG_64BIT)
+static inline __u64 mpi3mr_readq(const volatile void __iomem *addr)
+{
+	return readq(addr);
+}
+#else
+static inline __u64 mpi3mr_readq(const volatile void __iomem *addr)
+{
+	const volatile u32 __iomem *p = addr;
+	u32 low, high;
+
+	low = readl(p);
+	high = readl(p + 1);
+	return low + ((u64)high << 32);
 }
 #endif
 
@@ -124,8 +147,9 @@ static void mpi3mr_repost_reply_buf(struct mpi3mr_ioc *mrioc,
 	u64 reply_dma)
 {
 	u32 old_idx = 0;
+	unsigned long flags;
 
-	spin_lock(&mrioc->reply_free_queue_lock);
+	spin_lock_irqsave(&mrioc->reply_free_queue_lock, flags);
 	old_idx  =  mrioc->reply_free_queue_host_index;
 	mrioc->reply_free_queue_host_index = (
 	    (mrioc->reply_free_queue_host_index ==
@@ -134,15 +158,16 @@ static void mpi3mr_repost_reply_buf(struct mpi3mr_ioc *mrioc,
 	mrioc->reply_free_q[old_idx] = cpu_to_le64(reply_dma);
 	writel(mrioc->reply_free_queue_host_index,
 	    &mrioc->sysif_regs->reply_free_host_index);
-	spin_unlock(&mrioc->reply_free_queue_lock);
+	spin_unlock_irqrestore(&mrioc->reply_free_queue_lock, flags);
 }
 
 void mpi3mr_repost_sense_buf(struct mpi3mr_ioc *mrioc,
 	u64 sense_buf_dma)
 {
 	u32 old_idx = 0;
+	unsigned long flags;
 
-	spin_lock(&mrioc->sbq_lock);
+	spin_lock_irqsave(&mrioc->sbq_lock, flags);
 	old_idx  =  mrioc->sbq_host_index;
 	mrioc->sbq_host_index = ((mrioc->sbq_host_index ==
 	    (mrioc->sense_buf_q_sz - 1)) ? 0 :
@@ -150,7 +175,7 @@ void mpi3mr_repost_sense_buf(struct mpi3mr_ioc *mrioc,
 	mrioc->sense_buf_q[old_idx] = cpu_to_le64(sense_buf_dma);
 	writel(mrioc->sbq_host_index,
 	    &mrioc->sysif_regs->sense_buffer_free_host_index);
-	spin_unlock(&mrioc->sbq_lock);
+	spin_unlock_irqrestore(&mrioc->sbq_lock, flags);
 }
 
 static void mpi3mr_print_event_data(struct mpi3mr_ioc *mrioc,
@@ -2181,9 +2206,11 @@ static int mpi3mr_setup_admin_qpair(struct mpi3mr_ioc *mrioc)
 	    (mrioc->num_admin_req);
 	writel(num_admin_entries, &mrioc->sysif_regs->admin_queue_num_entries);
 	mpi3mr_writeq(mrioc->admin_req_dma,
-	    &mrioc->sysif_regs->admin_request_queue_address);
+	    &mrioc->sysif_regs->admin_request_queue_address,
+	    &mrioc->adm_req_q_bar_writeq_lock);
 	mpi3mr_writeq(mrioc->admin_reply_dma,
-	    &mrioc->sysif_regs->admin_reply_queue_address);
+	    &mrioc->sysif_regs->admin_reply_queue_address,
+	    &mrioc->adm_reply_q_bar_writeq_lock);
 	writel(mrioc->admin_req_pi, &mrioc->sysif_regs->admin_request_queue_pi);
 	writel(mrioc->admin_reply_ci, &mrioc->sysif_regs->admin_reply_queue_ci);
 	return retval;
@@ -3231,7 +3258,7 @@ int mpi3mr_init_ioc(struct mpi3mr_ioc *mrioc, u8 init_type)
 	ioc_info(mrioc, "SOD status %x configuration %x\n",
 	    ioc_status, ioc_config);
 
-	base_info = lo_hi_readq(&mrioc->sysif_regs->ioc_information);
+	base_info = mpi3mr_readq(&mrioc->sysif_regs->ioc_information);
 	ioc_info(mrioc, "SOD base_info %llx\n",	base_info);
 
 	/*The timeout value is in 2sec unit, changing it to seconds*/
