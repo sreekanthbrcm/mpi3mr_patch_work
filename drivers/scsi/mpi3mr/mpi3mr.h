@@ -66,6 +66,7 @@ extern int prot_mask;
 
 /* Definitions for internal SGL and Chain SGL buffers */
 #define MPI3MR_PAGE_SIZE_4K		4096
+#define MPI3MR_CHAINSGE_SIZE	MPI3MR_PAGE_SIZE_4K
 #define MPI3MR_SG_DEPTH		(MPI3MR_PAGE_SIZE_4K / sizeof(struct mpi3_sge_common))
 
 /* Definitions for MAX values for shost */
@@ -509,6 +510,7 @@ static inline void mpi3mr_tgtdev_put(struct mpi3mr_tgt_dev *s)
  * @dev_removed: Device removed in the Firmware
  * @dev_removedelay: Device is waiting to be removed in FW
  * @dev_type: Device type
+ * @dev_nvme_dif: Deice is NVMe DIF enabled
  * @tgt_dev: Internal target device pointer
  */
 struct mpi3mr_stgt_priv_data {
@@ -520,6 +522,7 @@ struct mpi3mr_stgt_priv_data {
 	u8 dev_removed;
 	u8 dev_removedelay;
 	u8 dev_type;
+	u8 dev_nvme_dif;
 	struct mpi3mr_tgt_dev *tgt_dev;
 };
 
@@ -717,6 +720,7 @@ struct scmd_priv {
  * @driver_info: Driver, Kernel, OS information to firmware
  * @change_count: Topology change count
  * @op_reply_q_offset: Operational reply queue offset with MSIx
+ * @check_xprotect_nvme: Flag to check xprotect for nvme or not
  * @adm_req_q_bar_writeq_lock: Admin request queue lock
  * @adm_reply_q_bar_writeq_lock: Admin reply queue lock
  */
@@ -855,6 +859,9 @@ struct mpi3mr_ioc {
 	struct mpi3_driver_info_layout driver_info;
 	u16 change_count;
 	u16 op_reply_q_offset;
+
+	bool check_xprotect_nvme;
+
 	spinlock_t adm_req_q_bar_writeq_lock;
 	spinlock_t adm_reply_q_bar_writeq_lock;
 };
