@@ -8,6 +8,9 @@
  */
 
 #include "mpi3mr.h"
+static int mpi3mr_issue_reset(struct mpi3mr_ioc *mrioc, u16 reset_type,
+	u32 reset_reason);
+static int mpi3mr_setup_admin_qpair(struct mpi3mr_ioc *mrioc);
 
 #if defined(writeq) && defined(CONFIG_64BIT)
 static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
@@ -101,6 +104,7 @@ static void mpi3mr_cleanup_isr(struct mpi3mr_ioc *mrioc)
 	kfree(mrioc->intr_info);
 	mrioc->intr_info = NULL;
 	mrioc->intr_info_count = 0;
+	mrioc->is_intr_info_set = false;
 	pci_free_irq_vectors(mrioc->pdev);
 }
 
@@ -694,6 +698,9 @@ static int mpi3mr_setup_isr(struct mpi3mr_ioc *mrioc, u8 setup_one)
 	int i;
 	struct irq_affinity desc = { .pre_vectors =  1};
 
+	if (mrioc->is_intr_info_set)
+		return 0;
+
 	mpi3mr_cleanup_isr(mrioc);
 
 	if (setup_one || reset_devices)
@@ -745,6 +752,8 @@ static int mpi3mr_setup_isr(struct mpi3mr_ioc *mrioc, u8 setup_one)
 			goto out_failed;
 		}
 	}
+	if (reset_devices || !setup_one)
+		mrioc->is_intr_info_set = true;
 	mrioc->intr_info_count = max_vectors;
 	mpi3mr_ioc_enable_intr(mrioc);
 	return 0;
@@ -1015,26 +1024,105 @@ static int mpi3mr_issue_and_process_mur(struct mpi3mr_ioc *mrioc,
  * Set Enable IOC bit in IOC configuration register and wait for
  * the controller to become ready.
  *
- * Return: 0 on success, -1 on failure.
+ * Return: 0 on success, appropriate error on failure.
  */
 static int mpi3mr_bring_ioc_ready(struct mpi3mr_ioc *mrioc)
 {
-	u32 ioc_config, timeout;
-	enum mpi3mr_iocstate current_state;
+	u32 ioc_config, ioc_status, timeout;
+	int retval = 0;
+	enum mpi3mr_iocstate ioc_state;
+	u64 base_info;
 
+	ioc_status = readl(&mrioc->sysif_regs->ioc_status);
+	ioc_config = readl(&mrioc->sysif_regs->ioc_configuration);
+	base_info = mpi3mr_readq(&mrioc->sysif_regs->ioc_information);
+	ioc_info(mrioc, "ioc_status(0x%08x), ioc_config(0x%08x), ioc_info(0x%016llx) at the bringup\n",
+	    ioc_status, ioc_config, base_info);
+
+	/*The timeout value is in 2sec unit, changing it to seconds*/
+	mrioc->ready_timeout =
+	    ((base_info & MPI3_SYSIF_IOC_INFO_LOW_TIMEOUT_MASK) >>
+	    MPI3_SYSIF_IOC_INFO_LOW_TIMEOUT_SHIFT) * 2;
+
+	ioc_info(mrioc, "ready timeout: %d seconds\n", mrioc->ready_timeout);
+
+	ioc_state = mpi3mr_get_iocstate(mrioc);
+	ioc_info(mrioc, "controller is in %s state during detection\n",
+	    mpi3mr_iocstate_name(ioc_state));
+
+	if (ioc_state == MRIOC_STATE_BECOMING_READY ||
+	    ioc_state == MRIOC_STATE_RESET_REQUESTED) {
+		timeout = mrioc->ready_timeout * 10;
+		do {
+			msleep(100);
+		} while (--timeout);
+
+		ioc_state = mpi3mr_get_iocstate(mrioc);
+		ioc_info(mrioc,
+		    "controller is in %s state after waiting to reset\n",
+		    mpi3mr_iocstate_name(ioc_state));
+	}
+
+	if (ioc_state == MRIOC_STATE_READY) {
+		ioc_info(mrioc, "issuing message unit reset (MUR) to bring to reset state\n");
+		retval = mpi3mr_issue_and_process_mur(mrioc,
+		    MPI3MR_RESET_FROM_BRINGUP);
+		ioc_state = mpi3mr_get_iocstate(mrioc);
+		if (retval)
+			ioc_err(mrioc,
+			    "message unit reset failed with error %d current state %s\n",
+			    retval, mpi3mr_iocstate_name(ioc_state));
+	}
+	if (ioc_state != MRIOC_STATE_RESET) {
+		mpi3mr_print_fault_info(mrioc);
+		ioc_info(mrioc, "issuing soft reset to bring to reset state\n");
+		retval = mpi3mr_issue_reset(mrioc,
+		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_SOFT_RESET,
+		    MPI3MR_RESET_FROM_BRINGUP);
+		if (retval) {
+			ioc_err(mrioc,
+			    "soft reset failed with error %d\n", retval);
+			goto out_failed;
+		}
+	}
+	ioc_state = mpi3mr_get_iocstate(mrioc);
+	if (ioc_state != MRIOC_STATE_RESET) {
+		ioc_err(mrioc,
+		    "cannot bring controller to reset state, current state: %s\n",
+		    mpi3mr_iocstate_name(ioc_state));
+		goto out_failed;
+	}
+	mpi3mr_clear_reset_history(mrioc);
+	retval = mpi3mr_setup_admin_qpair(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to setup admin queues: error %d\n",
+		    retval);
+		goto out_failed;
+	}
+
+	ioc_info(mrioc, "bringing controller to ready state\n");
 	ioc_config = readl(&mrioc->sysif_regs->ioc_configuration);
 	ioc_config |= MPI3_SYSIF_IOC_CONFIG_ENABLE_IOC;
 	writel(ioc_config, &mrioc->sysif_regs->ioc_configuration);
 
 	timeout = mrioc->ready_timeout * 10;
 	do {
-		current_state = mpi3mr_get_iocstate(mrioc);
-		if (current_state == MRIOC_STATE_READY)
+		ioc_state = mpi3mr_get_iocstate(mrioc);
+		if (ioc_state == MRIOC_STATE_READY) {
+			ioc_info(mrioc,
+			    "successfully transistioned to %s state\n",
+			    mpi3mr_iocstate_name(ioc_state));
 			return 0;
+		}
 		msleep(100);
 	} while (--timeout);
 
-	return -1;
+out_failed:
+	ioc_state = mpi3mr_get_iocstate(mrioc);
+	ioc_err(mrioc,
+	    "failed to bring to ready state,  current state: %s\n",
+	    mpi3mr_iocstate_name(ioc_state));
+	return retval;
 }
 
 /**
@@ -1652,7 +1740,8 @@ static int mpi3mr_create_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 		goto out_unlock;
 	}
 	op_reply_q->qid = reply_qid;
-	mrioc->intr_info[midx].op_reply_q = op_reply_q;
+	if (midx < mrioc->intr_info_count)
+		mrioc->intr_info[midx].op_reply_q = op_reply_q;
 
 out_unlock:
 	mrioc->init_cmds.state = MPI3MR_CMD_NOTUSED;
@@ -2576,13 +2665,17 @@ static int mpi3mr_alloc_reply_sense_bufs(struct mpi3mr_ioc *mrioc)
 {
 	int retval = 0;
 	u32 sz, i;
-	dma_addr_t phy_addr;
+
 
 	if (mrioc->init_cmds.reply)
-		goto post_reply_sbuf;
+		return retval;
 
 	mrioc->init_cmds.reply = kzalloc(mrioc->facts.reply_sz, GFP_KERNEL);
 	if (!mrioc->init_cmds.reply)
+		goto out_failed;
+
+	mrioc->host_tm_cmds.reply = kzalloc(mrioc->facts.reply_sz, GFP_KERNEL);
+	if (!mrioc->host_tm_cmds.reply)
 		goto out_failed;
 
 	for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++) {
@@ -2591,11 +2684,6 @@ static int mpi3mr_alloc_reply_sense_bufs(struct mpi3mr_ioc *mrioc)
 		if (!mrioc->dev_rmhs_cmds[i].reply)
 			goto out_failed;
 	}
-
-	mrioc->host_tm_cmds.reply = kzalloc(mrioc->facts.reply_sz, GFP_KERNEL);
-	if (!mrioc->host_tm_cmds.reply)
-		goto out_failed;
-
 	mrioc->dev_handle_bitmap_sz = mrioc->facts.max_devhandle / 8;
 	if (mrioc->facts.max_devhandle % 8)
 		mrioc->dev_handle_bitmap_sz++;
@@ -2672,7 +2760,28 @@ static int mpi3mr_alloc_reply_sense_bufs(struct mpi3mr_ioc *mrioc)
 	if (!mrioc->sense_buf_q)
 		goto out_failed;
 
-post_reply_sbuf:
+	return retval;
+
+out_failed:
+	retval = -1;
+	return retval;
+}
+
+/**
+ * mpimr_initialize_reply_sbuf_queues - initialize reply sense
+ * buffers
+ * @mrioc: Adapter instance reference
+ *
+ * Helper function to initialize reply and sense buffers along
+ * with some debug prints.
+ *
+ * Return:  None.
+ */
+static void mpimr_initialize_reply_sbuf_queues(struct mpi3mr_ioc *mrioc)
+{
+	u32 sz, i;
+	dma_addr_t phy_addr;
+
 	sz = mrioc->num_reply_bufs * mrioc->facts.reply_sz;
 	ioc_info(mrioc,
 	    "reply buf pool(0x%p): depth(%d), frame_size(%d), pool_size(%d kB), reply_dma(0x%llx)\n",
@@ -2705,11 +2814,6 @@ post_reply_sbuf:
 	    i < mrioc->num_sense_bufs; i++, phy_addr += MPI3MR_SENSE_BUF_SZ)
 		mrioc->sense_buf_q[i] = cpu_to_le64(phy_addr);
 	mrioc->sense_buf_q[i] = cpu_to_le64(0);
-	return retval;
-
-out_failed:
-	retval = -1;
-	return retval;
 }
 
 /**
@@ -2736,6 +2840,8 @@ static int mpi3mr_issue_iocinit(struct mpi3mr_ioc *mrioc)
 		retval = -1;
 		goto out;
 	}
+	mpimr_initialize_reply_sbuf_queues(mrioc);
+
 	drv_info->information_length = cpu_to_le32(data_len);
 	strscpy(drv_info->driver_signature, "Broadcom", sizeof(drv_info->driver_signature));
 	strscpy(drv_info->os_name, utsname()->sysname, sizeof(drv_info->os_name));
@@ -2805,6 +2911,13 @@ static int mpi3mr_issue_iocinit(struct mpi3mr_ioc *mrioc)
 		goto out_unlock;
 	}
 
+	mrioc->reply_free_queue_host_index = mrioc->num_reply_bufs;
+	writel(mrioc->reply_free_queue_host_index,
+	    &mrioc->sysif_regs->reply_free_host_index);
+
+	mrioc->sbq_host_index = mrioc->num_sense_bufs;
+	writel(mrioc->sbq_host_index,
+	    &mrioc->sysif_regs->sense_buffer_free_host_index);
 out_unlock:
 	mrioc->init_cmds.state = MPI3MR_CMD_NOTUSED;
 	mutex_unlock(&mrioc->init_cmds.mutex);
@@ -2987,6 +3100,9 @@ static int mpi3mr_alloc_chain_bufs(struct mpi3mr_ioc *mrioc)
 	int retval = 0;
 	u32 sz, i;
 	u16 num_chains;
+
+	if (mrioc->chain_sgl_list)
+		return retval;
 
 	num_chains = mrioc->max_host_ios / MPI3MR_CHAINBUF_FACTOR;
 
@@ -3313,207 +3429,19 @@ out_failed:
 }
 
 /**
- * mpi3mr_init_ioc - Initialize the controller
+ * mpi3mr_enable_events - Enable required events
  * @mrioc: Adapter instance reference
- * @init_type: Flag to indicate is the init_type
  *
- * This the controller initialization routine, executed either
- * after soft reset or from pci probe callback.
- * Setup the required resources, memory map the controller
- * registers, create admin and operational reply queue pairs,
- * allocate required memory for reply pool, sense buffer pool,
- * issue IOC init request to the firmware, unmask the events and
- * issue port enable to discover SAS/SATA/NVMe devies and RAID
- * volumes.
+ * This routine unmasks the events required by the driver by
+ * sennding appropriate event mask bitmapt through an event
+ * notification request.
  *
  * Return: 0 on success and non-zero on failure.
  */
-int mpi3mr_init_ioc(struct mpi3mr_ioc *mrioc, u8 init_type)
+int mpi3mr_enable_events(struct mpi3mr_ioc *mrioc)
 {
 	int retval = 0;
-	enum mpi3mr_iocstate ioc_state;
-	u64 base_info;
-	u32 timeout;
-	u32 ioc_status, ioc_config, i;
-	struct mpi3_ioc_facts_data facts_data;
-
-	mrioc->irqpoll_sleep = MPI3MR_IRQ_POLL_SLEEP;
-	mrioc->change_count = 0;
-	if (init_type == MPI3MR_IT_INIT) {
-		mrioc->cpu_count = num_online_cpus();
-		retval = mpi3mr_setup_resources(mrioc);
-		if (retval) {
-			ioc_err(mrioc, "Failed to setup resources:error %d\n",
-			    retval);
-			goto out_nocleanup;
-		}
-	}
-
-	ioc_status = readl(&mrioc->sysif_regs->ioc_status);
-	ioc_config = readl(&mrioc->sysif_regs->ioc_configuration);
-
-	ioc_info(mrioc, "SOD status %x configuration %x\n",
-	    ioc_status, ioc_config);
-
-	base_info = mpi3mr_readq(&mrioc->sysif_regs->ioc_information);
-	ioc_info(mrioc, "SOD base_info %llx\n",	base_info);
-
-	/*The timeout value is in 2sec unit, changing it to seconds*/
-	mrioc->ready_timeout =
-	    ((base_info & MPI3_SYSIF_IOC_INFO_LOW_TIMEOUT_MASK) >>
-	    MPI3_SYSIF_IOC_INFO_LOW_TIMEOUT_SHIFT) * 2;
-
-	ioc_info(mrioc, "IOC ready timeout %d\n", mrioc->ready_timeout);
-
-	ioc_state = mpi3mr_get_iocstate(mrioc);
-	ioc_info(mrioc, "IOC in %s state during detection\n",
-	    mpi3mr_iocstate_name(ioc_state));
-
-	if (ioc_state == MRIOC_STATE_BECOMING_READY ||
-	    ioc_state == MRIOC_STATE_RESET_REQUESTED) {
-		timeout = mrioc->ready_timeout * 10;
-		do {
-			msleep(100);
-		} while (--timeout);
-
-		ioc_state = mpi3mr_get_iocstate(mrioc);
-		ioc_info(mrioc,
-		    "IOC in %s state after waiting for reset time\n",
-		    mpi3mr_iocstate_name(ioc_state));
-	}
-
-	if (ioc_state == MRIOC_STATE_READY) {
-		retval = mpi3mr_issue_and_process_mur(mrioc,
-		    MPI3MR_RESET_FROM_BRINGUP);
-		if (retval) {
-			ioc_err(mrioc, "Failed to MU reset IOC error %d\n",
-			    retval);
-		}
-		ioc_state = mpi3mr_get_iocstate(mrioc);
-	}
-	if (ioc_state != MRIOC_STATE_RESET) {
-		mpi3mr_print_fault_info(mrioc);
-		retval = mpi3mr_issue_reset(mrioc,
-		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_SOFT_RESET,
-		    MPI3MR_RESET_FROM_BRINGUP);
-		if (retval) {
-			ioc_err(mrioc,
-			    "%s :Failed to soft reset IOC error %d\n",
-			    __func__, retval);
-			goto out_failed;
-		}
-	}
-	ioc_state = mpi3mr_get_iocstate(mrioc);
-	if (ioc_state != MRIOC_STATE_RESET) {
-		retval = -1;
-		ioc_err(mrioc, "Cannot bring IOC to reset state\n");
-		goto out_failed;
-	}
-
-	retval = mpi3mr_setup_admin_qpair(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "Failed to setup admin Qs: error %d\n",
-		    retval);
-		goto out_failed;
-	}
-
-	retval = mpi3mr_bring_ioc_ready(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "Failed to bring ioc ready: error %d\n",
-		    retval);
-		goto out_failed;
-	}
-
-	if (init_type != MPI3MR_IT_RESET) {
-		retval = mpi3mr_setup_isr(mrioc, 1);
-		if (retval) {
-			ioc_err(mrioc, "Failed to setup ISR error %d\n",
-			    retval);
-			goto out_failed;
-		}
-	} else
-		mpi3mr_ioc_enable_intr(mrioc);
-
-	retval = mpi3mr_issue_iocfacts(mrioc, &facts_data);
-	if (retval) {
-		ioc_err(mrioc, "Failed to Issue IOC Facts %d\n",
-		    retval);
-		goto out_failed;
-	}
-
-	mpi3mr_process_factsdata(mrioc, &facts_data);
-	if (init_type == MPI3MR_IT_INIT) {
-		retval = mpi3mr_check_reset_dma_mask(mrioc);
-		if (retval) {
-			ioc_err(mrioc, "Resetting dma mask failed %d\n",
-			    retval);
-			goto out_failed;
-		}
-	}
-
-	mpi3mr_print_ioc_info(mrioc);
-
-	retval = mpi3mr_alloc_reply_sense_bufs(mrioc);
-	if (retval) {
-		ioc_err(mrioc,
-		    "%s :Failed to allocated reply sense buffers %d\n",
-		    __func__, retval);
-		goto out_failed;
-	}
-
-	if (init_type == MPI3MR_IT_INIT) {
-		retval = mpi3mr_alloc_chain_bufs(mrioc);
-		if (retval) {
-			ioc_err(mrioc, "Failed to allocated chain buffers %d\n",
-			    retval);
-			goto out_failed;
-		}
-	}
-
-	retval = mpi3mr_issue_iocinit(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "Failed to Issue IOC Init %d\n",
-		    retval);
-		goto out_failed;
-	}
-	mrioc->reply_free_queue_host_index = mrioc->num_reply_bufs;
-	writel(mrioc->reply_free_queue_host_index,
-	    &mrioc->sysif_regs->reply_free_host_index);
-
-	mrioc->sbq_host_index = mrioc->num_sense_bufs;
-	writel(mrioc->sbq_host_index,
-	    &mrioc->sysif_regs->sense_buffer_free_host_index);
-
-	retval = mpi3mr_print_pkg_ver(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "failed to get package version\n");
-		goto out_failed;
-	}
-
-	if (init_type != MPI3MR_IT_RESET) {
-		retval = mpi3mr_setup_isr(mrioc, 0);
-		if (retval) {
-			ioc_err(mrioc, "Failed to re-setup ISR, error %d\n",
-			    retval);
-			goto out_failed;
-		}
-	}
-
-	retval = mpi3mr_create_op_queues(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "Failed to create OpQueues error %d\n",
-		    retval);
-		goto out_failed;
-	}
-
-	if ((init_type != MPI3MR_IT_INIT) &&
-	    (mrioc->shost->nr_hw_queues > mrioc->num_op_reply_q)) {
-		retval = -1;
-		ioc_err(mrioc,
-		    "Cannot create minimum number of OpQueues expected:%d created:%d\n",
-		    mrioc->shost->nr_hw_queues, mrioc->num_op_reply_q);
-		goto out_failed;
-	}
+	u32  i;
 
 	for (i = 0; i < MPI3_EVENT_NOTIFY_EVENTMASK_WORDS; i++)
 		mrioc->event_masks[i] = -1;
@@ -3528,33 +3456,260 @@ int mpi3mr_init_ioc(struct mpi3mr_ioc *mrioc, u8 init_type)
 	mpi3mr_unmask_events(mrioc, MPI3_EVENT_SAS_BROADCAST_PRIMITIVE);
 	mpi3mr_unmask_events(mrioc, MPI3_EVENT_PCIE_TOPOLOGY_CHANGE_LIST);
 	mpi3mr_unmask_events(mrioc, MPI3_EVENT_PCIE_ENUMERATION);
+	mpi3mr_unmask_events(mrioc, MPI3_EVENT_PREPARE_FOR_RESET);
 	mpi3mr_unmask_events(mrioc, MPI3_EVENT_CABLE_MGMT);
 	mpi3mr_unmask_events(mrioc, MPI3_EVENT_ENERGY_PACK_CHANGE);
+	mpi3mr_unmask_events(mrioc, MPI3_EVENT_LOG_DATA);
+	mpi3mr_unmask_events(mrioc, MPI3_EVENT_TEMP_THRESHOLD);
+	mpi3mr_unmask_events(mrioc, MPI3_EVENT_DIAGNOSTIC_BUFFER_STATUS_CHANGE);
 
 	retval = mpi3mr_issue_event_notification(mrioc);
-	if (retval) {
-		ioc_err(mrioc, "Failed to issue event notification %d\n",
+	if (retval)
+		ioc_err(mrioc, "failed to issue event notification %d\n",
 		    retval);
+	return retval;
+}
+
+
+/**
+ * mpi3mr_init_ioc - Initialize the controller
+ * @mrioc: Adapter instance reference
+ *
+ * This the controller initialization routine, executed  from
+ * pci probe callback. Creates admin and operational reply queue
+ * pairs, allocate required memory for reply pool, sense buffer
+ * pool, issue IOC init request to the firmware, unmask the
+ * events.
+ *
+ * Return: 0 on success and non-zero on failure.
+ */
+int mpi3mr_init_ioc(struct mpi3mr_ioc *mrioc)
+{
+	int retval = 0;
+	u8 retry = 0;
+	struct mpi3_ioc_facts_data facts_data;
+
+retry_init:
+	dprint_init(mrioc, "bringing up the controller to ready state\n");
+	retval = mpi3mr_bring_ioc_ready(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to bring to ready state\n");
+		goto out_failed_noretry;
+	}
+
+	dprint_init(mrioc, "setting up single ISR\n");
+	retval = mpi3mr_setup_isr(mrioc, 1);
+	if (retval) {
+		ioc_err(mrioc, "failed to setup ISR\n");
+		goto out_failed_noretry;
+	}
+
+	dprint_init(mrioc, "getting ioc_facts\n");
+	retval = mpi3mr_issue_iocfacts(mrioc, &facts_data);
+	if (retval) {
+		ioc_err(mrioc, "failed to get ioc_facts\n");
 		goto out_failed;
 	}
 
-	if (init_type != MPI3MR_IT_INIT) {
-		ioc_info(mrioc, "Issuing Port Enable\n");
-		retval = mpi3mr_issue_port_enable(mrioc, 0);
+	mpi3mr_process_factsdata(mrioc, &facts_data);
+	mrioc->max_host_ios = mrioc->facts.max_reqs - MPI3MR_INTERNAL_CMDS_RESVD;
+
+	if (reset_devices)
+		mrioc->max_host_ios = min_t(int, mrioc->max_host_ios,
+		    MPI3MR_HOST_IOS_KDUMP);
+
+	dprint_init(mrioc, "check and reset dma mask\n");
+	retval = mpi3mr_check_reset_dma_mask(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "resetting dma mask failed\n");
+		goto out_failed_noretry;
+	}
+
+	mpi3mr_print_ioc_info(mrioc);
+
+	dprint_init(mrioc, "allocating reply and sense buffers\n");
+	retval = mpi3mr_alloc_reply_sense_bufs(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to allocate reply and sense buffers\n");
+		goto out_failed_noretry;
+	}
+
+	dprint_init(mrioc, "allocating chain buffers\n");
+	retval = mpi3mr_alloc_chain_bufs(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to allocate chain buffers\n");
+		goto out_failed_noretry;
+	}
+
+	dprint_init(mrioc, "sending ioc_init\n");
+	retval = mpi3mr_issue_iocinit(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to send ioc_init\n");
+		goto out_failed;
+	}
+
+	dprint_init(mrioc, "getting package version\n");
+	retval = mpi3mr_print_pkg_ver(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to get package version\n");
+		goto out_failed;
+	}
+
+	dprint_init(mrioc, "setting up multiple ISR\n");
+	retval = mpi3mr_setup_isr(mrioc, 0);
+	if (retval) {
+		ioc_err(mrioc, "failed to re-setup ISR\n");
+		goto out_failed_noretry;
+	}
+
+	dprint_init(mrioc, "creating operational queue pairs\n");
+	retval = mpi3mr_create_op_queues(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to create operational queue pairs\n");
+		goto out_failed;
+	}
+
+	dprint_init(mrioc, "enabling events\n");
+	retval = mpi3mr_enable_events(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to enable events\n");
+		goto out_failed;
+	}
+
+	ioc_info(mrioc, "controller initialization completed successfully\n");
+	return retval;
+out_failed:
+	if (retry < 2) {
+		retry++;
+		ioc_warn(mrioc, "retrying controller initialization, retry_count:%d\n",
+		    retry);
+		mpi3mr_memset_buffers(mrioc);
+		goto retry_init;
+	}
+out_failed_noretry:
+	ioc_err(mrioc, "controller initialization failed\n");
+	mpi3mr_issue_reset(mrioc, MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+	    MPI3MR_RESET_FROM_CTLR_CLEANUP);
+	mrioc->unrecoverable = 1;
+	return retval;
+}
+
+/**
+ * mpi3mr_reinit_ioc - Re-Initialize the controller
+ * @mrioc: Adapter instance reference
+ * @is_resume: Called from resume or reset path
+ *
+ * This the controller re-initialization routine, executed  from
+ * the soft reset handler or resume callback. creates
+ * operational reply queue pairs, allocate required memory for
+ * reply pool, sense buffer pool, issue IOC init request to the
+ * firmware, unmask the events and issue port enable to discover
+ * SAS/SATA/NVMe devices and RAID volumes.
+ *
+ * Return: 0 on success and non-zero on failure.
+ */
+int mpi3mr_reinit_ioc(struct mpi3mr_ioc *mrioc, u8 is_resume)
+{
+	int retval = 0;
+	u8 retry = 0;
+	struct mpi3_ioc_facts_data facts_data;
+
+retry_init:
+	dprint_reset(mrioc, "bringing up the controller to ready state\n");
+	retval = mpi3mr_bring_ioc_ready(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to bring to ready state\n");
+		goto out_failed_noretry;
+	}
+
+	if (is_resume) {
+		dprint_reset(mrioc, "setting up single ISR\n");
+		retval = mpi3mr_setup_isr(mrioc, 1);
 		if (retval) {
-			ioc_err(mrioc, "Failed to issue port enable %d\n",
-			    retval);
-			goto out_failed;
+			ioc_err(mrioc, "failed to setup ISR\n");
+			goto out_failed_noretry;
+		}
+	} else
+		mpi3mr_ioc_enable_intr(mrioc);
+
+	dprint_reset(mrioc, "getting ioc_facts\n");
+	retval = mpi3mr_issue_iocfacts(mrioc, &facts_data);
+	if (retval) {
+		ioc_err(mrioc, "failed to get ioc_facts\n");
+		goto out_failed;
+	}
+
+	mpi3mr_process_factsdata(mrioc, &facts_data);
+	mpi3mr_print_ioc_info(mrioc);
+
+	dprint_reset(mrioc, "sending ioc_init\n");
+	retval = mpi3mr_issue_iocinit(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to send ioc_init\n");
+		goto out_failed;
+	}
+
+	dprint_reset(mrioc, "getting package version\n");
+	retval = mpi3mr_print_pkg_ver(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to get package version\n");
+		goto out_failed;
+	}
+
+	if (is_resume) {
+		dprint_reset(mrioc, "setting up multiple ISR\n");
+		retval = mpi3mr_setup_isr(mrioc, 0);
+		if (retval) {
+			ioc_err(mrioc, "failed to re-setup ISR\n");
+			goto out_failed_noretry;
 		}
 	}
-	return retval;
 
+	dprint_reset(mrioc, "creating operational queue pairs\n");
+	retval = mpi3mr_create_op_queues(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to create operational queue pairs\n");
+		goto out_failed;
+	}
+
+	if (mrioc->shost->nr_hw_queues > mrioc->num_op_reply_q) {
+		ioc_err(mrioc,
+		    "cannot create minimum number of operatioanl queues expected:%d created:%d\n",
+		    mrioc->shost->nr_hw_queues, mrioc->num_op_reply_q);
+		goto out_failed_noretry;
+	}
+
+	dprint_reset(mrioc, "enabling events\n");
+	retval = mpi3mr_enable_events(mrioc);
+	if (retval) {
+		ioc_err(mrioc, "failed to enable events\n");
+		goto out_failed;
+	}
+
+	ioc_info(mrioc, "sending port enable\n");
+	retval = mpi3mr_issue_port_enable(mrioc, 0);
+	if (retval) {
+		ioc_err(mrioc, "failed to issue port enable\n");
+		goto out_failed;
+	}
+
+	ioc_info(mrioc, "controller %s completed successfully\n",
+	    (is_resume)?"resume":"re-initialization");
+	return retval;
 out_failed:
-	if (init_type == MPI3MR_IT_INIT)
-		mpi3mr_cleanup_ioc(mrioc, MPI3MR_COMPLETE_CLEANUP);
-	else
-		mpi3mr_cleanup_ioc(mrioc, MPI3MR_REINIT_FAILURE);
-out_nocleanup:
+	if (retry < 2) {
+		retry++;
+		ioc_warn(mrioc, "retrying controller %s, retry_count:%d\n",
+		    (is_resume)?"resume":"re-initialization", retry);
+		mpi3mr_memset_buffers(mrioc);
+		goto retry_init;
+	}
+out_failed_noretry:
+	ioc_err(mrioc, "controller %s is failed\n",
+	    (is_resume)?"resume":"re-initialization");
+	mpi3mr_issue_reset(mrioc, MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT,
+	    MPI3MR_RESET_FROM_CTLR_CLEANUP);
+	mrioc->unrecoverable = 1;
 	return retval;
 }
 
@@ -3618,17 +3773,22 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
 {
 	u16 i;
 
-	memset(mrioc->admin_req_base, 0, mrioc->admin_req_q_sz);
-	memset(mrioc->admin_reply_base, 0, mrioc->admin_reply_q_sz);
+	mrioc->change_count = 0;
+	if (mrioc->admin_req_base)
+		memset(mrioc->admin_req_base, 0, mrioc->admin_req_q_sz);
+	if (mrioc->admin_reply_base)
+		memset(mrioc->admin_reply_base, 0, mrioc->admin_reply_q_sz);
 
-	memset(mrioc->init_cmds.reply, 0, sizeof(*mrioc->init_cmds.reply));
-	memset(mrioc->host_tm_cmds.reply, 0,
-	    sizeof(*mrioc->host_tm_cmds.reply));
-	for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++)
-		memset(mrioc->dev_rmhs_cmds[i].reply, 0,
-		    sizeof(*mrioc->dev_rmhs_cmds[i].reply));
-	memset(mrioc->removepend_bitmap, 0, mrioc->dev_handle_bitmap_sz);
-	memset(mrioc->devrem_bitmap, 0, mrioc->devrem_bitmap_sz);
+	if (mrioc->init_cmds.reply) {
+		memset(mrioc->init_cmds.reply, 0, sizeof(*mrioc->init_cmds.reply));
+		memset(mrioc->host_tm_cmds.reply, 0,
+		    sizeof(*mrioc->host_tm_cmds.reply));
+		for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++)
+			memset(mrioc->dev_rmhs_cmds[i].reply, 0,
+			    sizeof(*mrioc->dev_rmhs_cmds[i].reply));
+		memset(mrioc->removepend_bitmap, 0, mrioc->dev_handle_bitmap_sz);
+		memset(mrioc->devrem_bitmap, 0, mrioc->devrem_bitmap_sz);
+	}
 
 	for (i = 0; i < mrioc->num_queues; i++) {
 		mrioc->op_reply_qinfo[i].qid = 0;
@@ -3657,11 +3817,12 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
  *
  * Return: Nothing.
  */
-static void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
+void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
 {
 	u16 i;
 	struct mpi3mr_intr_info *intr_info;
 
+	dprint_exit(mrioc, "freeing up memory allocated for the controller\n");
 	if (mrioc->sense_buf_pool) {
 		if (mrioc->sense_buf)
 			dma_pool_free(mrioc->sense_buf_pool, mrioc->sense_buf,
@@ -3721,6 +3882,11 @@ static void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
 	kfree(mrioc->host_tm_cmds.reply);
 	mrioc->host_tm_cmds.reply = NULL;
 
+	for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++) {
+		kfree(mrioc->dev_rmhs_cmds[i].reply);
+		mrioc->dev_rmhs_cmds[i].reply = NULL;
+	}
+
 	kfree(mrioc->removepend_bitmap);
 	mrioc->removepend_bitmap = NULL;
 
@@ -3729,11 +3895,6 @@ static void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
 
 	kfree(mrioc->chain_bitmap);
 	mrioc->chain_bitmap = NULL;
-
-	for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++) {
-		kfree(mrioc->dev_rmhs_cmds[i].reply);
-		mrioc->dev_rmhs_cmds[i].reply = NULL;
-	}
 
 	if (mrioc->chain_buf_pool) {
 		for (i = 0; i < mrioc->chain_buf_count; i++) {
@@ -3761,6 +3922,8 @@ static void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
 		    mrioc->admin_req_base, mrioc->admin_req_dma);
 		mrioc->admin_req_base = NULL;
 	}
+
+	dprint_exit(mrioc, "freed up memory allocated for the controller\n");
 }
 
 /**
@@ -3829,21 +3992,17 @@ static void mpi3mr_issue_ioc_shutdown(struct mpi3mr_ioc *mrioc)
 /**
  * mpi3mr_cleanup_ioc - Cleanup controller
  * @mrioc: Adapter instance reference
- * @reason: Cleanup reason
- *
+
  * controller cleanup handler, Message unit reset or soft reset
- * and shutdown notification is issued to the controller and the
- * associated memory resources are freed.
+ * and shutdown notification is issued to the controller.
  *
  * Return: Nothing.
  */
-void mpi3mr_cleanup_ioc(struct mpi3mr_ioc *mrioc, u8 reason)
+void mpi3mr_cleanup_ioc(struct mpi3mr_ioc *mrioc)
 {
 	enum mpi3mr_iocstate ioc_state;
 
-	if (reason == MPI3MR_COMPLETE_CLEANUP)
-		mpi3mr_stop_watchdog(mrioc);
-
+	dprint_exit(mrioc, "cleaning up the controller\n");
 	mpi3mr_ioc_disable_intr(mrioc);
 
 	ioc_state = mpi3mr_get_iocstate(mrioc);
@@ -3855,15 +4014,9 @@ void mpi3mr_cleanup_ioc(struct mpi3mr_ioc *mrioc, u8 reason)
 			mpi3mr_issue_reset(mrioc,
 			    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_SOFT_RESET,
 			    MPI3MR_RESET_FROM_MUR_FAILURE);
-
-		if (reason != MPI3MR_REINIT_FAILURE)
-			mpi3mr_issue_ioc_shutdown(mrioc);
+		mpi3mr_issue_ioc_shutdown(mrioc);
 	}
-
-	if (reason == MPI3MR_COMPLETE_CLEANUP) {
-		mpi3mr_free_mem(mrioc);
-		mpi3mr_cleanup_resources(mrioc);
-	}
+	dprint_exit(mrioc, "controller cleanup completed\n");
 }
 
 /**
@@ -4042,7 +4195,7 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
 	mpi3mr_flush_host_io(mrioc);
 	mpi3mr_invalidate_devhandles(mrioc);
 	mpi3mr_memset_buffers(mrioc);
-	retval = mpi3mr_init_ioc(mrioc, MPI3MR_IT_RESET);
+	retval = mpi3mr_reinit_ioc(mrioc, 0);
 	if (retval) {
 		pr_err(IOCNAME "reinit after soft reset failed: reason %d\n",
 		    mrioc->name, reset_reason);
