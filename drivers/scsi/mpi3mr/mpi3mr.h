@@ -91,7 +91,7 @@ extern int prot_mask;
 #define MPI3MR_HOSTTAG_IOCTLCMDS	2
 #define MPI3MR_HOSTTAG_BLK_TMS		5
 
-#define MPI3MR_NUM_DEVRMCMD		1
+#define MPI3MR_NUM_DEVRMCMD		16
 #define MPI3MR_HOSTTAG_DEVRMCMD_MIN	(MPI3MR_HOSTTAG_BLK_TMS + 1)
 #define MPI3MR_HOSTTAG_DEVRMCMD_MAX	(MPI3MR_HOSTTAG_DEVRMCMD_MIN + \
 						MPI3MR_NUM_DEVRMCMD - 1)
@@ -102,10 +102,10 @@ extern int prot_mask;
 #define MPI3MR_HOST_IOS_KDUMP		128
 
 /* command/controller interaction timeout definitions in seconds */
-#define MPI3MR_INTADMCMD_TIMEOUT		10
+#define MPI3MR_INTADMCMD_TIMEOUT		60
 #define MPI3MR_PORTENABLE_TIMEOUT		300
-#define MPI3MR_ABORTTM_TIMEOUT			30
-#define MPI3MR_RESETTM_TIMEOUT			30
+#define MPI3MR_ABORTTM_TIMEOUT			60
+#define MPI3MR_RESETTM_TIMEOUT			60
 #define MPI3MR_RESET_HOST_IOWAIT_TIMEOUT	5
 #define MPI3MR_TSUPDATE_INTERVAL		900
 #define MPI3MR_DEFAULT_SHUTDOWN_TIME		120
@@ -147,6 +147,7 @@ extern int prot_mask;
 			MPI3_SCSITASKMGMT_RSPCODE_IO_QUEUED_ON_IOC
 
 #define MPI3MR_DEFAULT_MDTS	(128 * 1024)
+#define MPI3MR_DEFAULT_PGSZEXP         (12)
 /* Command retry count definitions */
 #define MPI3MR_DEV_RMHS_RETRY_COUNT 3
 
@@ -389,6 +390,7 @@ struct tgt_dev_sas_sata {
  * @pgsz: Device page size
  * @abort_to: Timeout for abort TM
  * @reset_to: Timeout for Target/LUN reset TM
+ * @dev_info: Device information bits
  */
 struct tgt_dev_pcie {
 	u32 mdts;
@@ -396,6 +398,7 @@ struct tgt_dev_pcie {
 	u8 pgsz;
 	u8 abort_to;
 	u8 reset_to;
+	u16 dev_info;
 };
 
 /**
