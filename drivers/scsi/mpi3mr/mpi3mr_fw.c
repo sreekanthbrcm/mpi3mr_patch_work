@@ -14,6 +14,10 @@ static int mpi3mr_setup_admin_qpair(struct mpi3mr_ioc *mrioc);
 static void mpi3mr_process_factsdata(struct mpi3mr_ioc *mrioc,
 	struct mpi3_ioc_facts_data *facts_data);
 
+int poll_queues;
+module_param(poll_queues, int, 0444);
+MODULE_PARM_DESC(poll_queues, "Number of queues for io_uring poll mode. (Range 1 - 126)");
+
 extern bool enable_dix;
 
 #if defined(writeq) && defined(CONFIG_64BIT)
@@ -464,12 +468,14 @@ static int mpi3mr_process_admin_reply_q(struct mpi3mr_ioc *mrioc)
 }
 
 /**
- * mpi3mr_get_reply_desc - get reply descriptor frame corresponding to
- *	queue's consumer index from operational reply descriptor queue.
- * @op_reply_q: op_reply_qinfo object
- * @reply_ci: operational reply descriptor's queue consumer index
+ * mpi3mr_get_reply_desc - Get reply descriptor
+ * @op_reply_q: Operational reply queue info
+ * @reply_ci: Operational reply queue consumer index
  *
- * Returns reply descriptor frame address
+ * Get reply descriptor frame corresponding to a operational
+ * reply queue's consumer index
+ *
+ * Return: Reply descriptor address
  */
 static inline struct mpi3_default_reply_descriptor *
 mpi3mr_get_reply_desc(struct op_reply_qinfo *op_reply_q, u32 reply_ci)
@@ -485,10 +491,21 @@ mpi3mr_get_reply_desc(struct op_reply_qinfo *op_reply_q, u32 reply_ci)
 	return reply_desc;
 }
 
-static int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
-	struct mpi3mr_intr_info *intr_info)
+/**
+ * mpi3mr_process_op_reply_q - Operational reply queue handler
+ * @mrioc: Adapter instance reference
+ * @op_reply_q: Operational reply queue info
+ *
+ * Checks the specific operational reply queue and drains the
+ * reply queue entries until the queue is empty and process the
+ * individual reply descriptors.
+ *
+ * Return: 0 if queue is already processed,or number of reply
+ *	    descriptors processed.
+ */
+int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
+	struct op_reply_qinfo *op_reply_q)
 {
-	struct op_reply_qinfo *op_reply_q = intr_info->op_reply_q;
 	struct op_req_qinfo *op_req_q;
 	u32 exp_phase;
 	u32 reply_ci;
@@ -539,21 +556,65 @@ static int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
 		 * Ensure remaining completion happens from threaded ISR.
 		 */
 		if (num_op_reply > mrioc->max_host_ios) {
-			intr_info->op_reply_q->enable_irq_poll = true;
+			op_reply_q->enable_irq_poll = true;
 			break;
 		}
-
 	} while (1);
 
 	writel(reply_ci,
 	    &mrioc->sysif_regs->oper_queue_indexes[reply_qidx].consumer_index);
 	op_reply_q->ci = reply_ci;
 	op_reply_q->ephase = exp_phase;
-
 	atomic_dec(&op_reply_q->in_use);
+
 	return num_op_reply;
 }
 
+/**
+ * mpi3mr_blk_mq_poll - Operational reply queue handler
+ * @shost: SCSI Host reference
+ * @queue_num: Request queue number (w.r.t OS it is hardware context number)
+ *
+ * Checks the specific operational reply queue and drains the
+ * reply queue entries until the queue is empty and process the
+ * individual reply descriptors.
+ *
+ * Return: 0 if queue is already processed,or number of reply
+ *	    descriptors processed.
+ */
+int mpi3mr_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num)
+{
+	int num_entries = 0;
+	struct mpi3mr_ioc *mrioc;
+
+	mrioc = (struct mpi3mr_ioc *)shost->hostdata;
+
+	if ((mrioc->reset_in_progress || mrioc->prepare_for_reset))
+		return 0;
+
+	if (!atomic_add_unless(&mrioc->op_reply_qinfo[queue_num].busy_mq_poll,
+	    1, 1))
+		return 0;
+
+	num_entries = mpi3mr_process_op_reply_q(mrioc,
+			&mrioc->op_reply_qinfo[queue_num]);
+
+	atomic_dec(&mrioc->op_reply_qinfo[queue_num].busy_mq_poll);
+	return num_entries;
+}
+
+/**
+ * mpi3mr_isr_primary - Interrupt Handler worker
+ * @irq: IRQ
+ * @privdata: Interrupt info
+ *
+ * Checks for the MSIx index, if it is 0 calls admin reply queue
+ * processing routine. If the MSIx has an associated operational
+ * reply queue, the operational reply processing routine is
+ * called too.
+ *
+ * Return: IRQ_NONE or IRQ_HANDLED
+ */
 static irqreturn_t mpi3mr_isr_primary(int irq, void *privdata)
 {
 	struct mpi3mr_intr_info *intr_info = privdata;
@@ -574,7 +635,8 @@ static irqreturn_t mpi3mr_isr_primary(int irq, void *privdata)
 	if (!midx)
 		num_admin_replies = mpi3mr_process_admin_reply_q(mrioc);
 	if (intr_info->op_reply_q)
-		num_op_reply = mpi3mr_process_op_reply_q(mrioc, intr_info);
+		num_op_reply = mpi3mr_process_op_reply_q(mrioc,
+		    intr_info->op_reply_q);
 
 	if (num_admin_replies || num_op_reply)
 		return IRQ_HANDLED;
@@ -582,6 +644,17 @@ static irqreturn_t mpi3mr_isr_primary(int irq, void *privdata)
 		return IRQ_NONE;
 }
 
+/**
+ * mpi3mr_isr - Interrupt Handler
+ * @irq: IRQ
+ * @privdata: Interrupt info
+ *
+ * Executes reply queue draining and processing of reply
+ * descriptors by calling mpi3mr_isr_primary and if more replies
+ * are exepcted, schedule an IRE polling thread.
+ *
+ * Return: IRQ_NONE or IRQ_HANDLED or IRQ_WAKE_THREAD
+ */
 static irqreturn_t mpi3mr_isr(int irq, void *privdata)
 {
 	struct mpi3mr_intr_info *intr_info = privdata;
@@ -614,12 +687,13 @@ static irqreturn_t mpi3mr_isr(int irq, void *privdata)
 }
 
 /**
- * mpi3mr_isr_poll - Reply queue polling routine
+ * mpi3mr_isr_poll - ISR thread. Reply queue polling routine
  * @irq: IRQ
  * @privdata: Interrupt info
  *
- * poll for pending I/O completions in a loop until pending I/Os
- * present or controller queue depth I/Os are processed.
+ * Threaded ISR, polls for pending I/O completions in a loop
+ * until pending I/Os present or controller queue depth I/Os are
+ * processed.
  *
  * Return: IRQ_NONE or IRQ_HANDLED
  */
@@ -645,9 +719,10 @@ static irqreturn_t mpi3mr_isr_poll(int irq, void *privdata)
 			mpi3mr_process_admin_reply_q(mrioc);
 		if (intr_info->op_reply_q)
 			num_op_reply +=
-			    mpi3mr_process_op_reply_q(mrioc, intr_info);
+			    mpi3mr_process_op_reply_q(mrioc,
+				intr_info->op_reply_q);
 
-		usleep_range(mrioc->irqpoll_sleep, 10 * mrioc->irqpoll_sleep);
+		usleep_range(MPI3MR_IRQ_POLL_SLEEP, 10 * MPI3MR_IRQ_POLL_SLEEP);
 
 	} while (atomic_read(&intr_info->op_reply_q->pend_ios) &&
 	    (num_op_reply < mrioc->max_host_ios));
@@ -683,12 +758,31 @@ static inline int mpi3mr_request_irq(struct mpi3mr_ioc *mrioc, u16 index)
 	retval = request_threaded_irq(pci_irq_vector(pdev, index), mpi3mr_isr,
 	    mpi3mr_isr_poll, IRQF_SHARED, intr_info->name, intr_info);
 	if (retval) {
-		ioc_err(mrioc, "%s: Unable to allocate interrupt %d!\n",
+		ioc_err(mrioc, "%s: unable to allocate interrupt %d!\n",
 		    intr_info->name, pci_irq_vector(pdev, index));
 		return retval;
 	}
 
 	return retval;
+}
+
+static void mpi3mr_calc_poll_queues(struct mpi3mr_ioc *mrioc, u16 max_vectors)
+{
+	if (!mrioc->requested_poll_qcount)
+		return;
+
+	/* Reserved for Admin and Default Queue */
+	if (max_vectors > 2 &&
+		(mrioc->requested_poll_qcount < max_vectors - 2)) {
+		ioc_info(mrioc,
+		    "enabled polled queues (%d) msix (%d)\n",
+		    mrioc->requested_poll_qcount, max_vectors);
+	} else {
+		ioc_info(mrioc,
+		    "disabled polled queues (%d) msix (%d) because of no resources for default queue\n",
+		    mrioc->requested_poll_qcount, max_vectors);
+		mrioc->requested_poll_qcount = 0;
+	}
 }
 
 /**
@@ -703,51 +797,72 @@ static inline int mpi3mr_request_irq(struct mpi3mr_ioc *mrioc, u16 index)
 static int mpi3mr_setup_isr(struct mpi3mr_ioc *mrioc, u8 setup_one)
 {
 	unsigned int irq_flags = PCI_IRQ_MSIX;
-	int max_vectors;
+	int max_vectors, min_vec;
 	int retval;
 	int i;
-	struct irq_affinity desc = { .pre_vectors =  1};
+	struct irq_affinity desc = { .pre_vectors =  1, .post_vectors = 1 };
 
 	if (mrioc->is_intr_info_set)
 		return 0;
 
 	mpi3mr_cleanup_isr(mrioc);
 
-	if (setup_one || reset_devices)
+	if (setup_one || reset_devices) {
 		max_vectors = 1;
-	else {
+		retval = pci_alloc_irq_vectors(mrioc->pdev,
+		    1, max_vectors, irq_flags);
+		if (retval < 0) {
+			ioc_err(mrioc, "cannot allocate irq vectors, ret %d\n",
+			    retval);
+			goto out_failed;
+		}
+	} else {
 		max_vectors =
-		    min_t(int, mrioc->cpu_count + 1, mrioc->msix_count);
+		    min_t(int, mrioc->cpu_count + 1 +
+			mrioc->requested_poll_qcount, mrioc->msix_count);
+
+		mpi3mr_calc_poll_queues(mrioc, max_vectors);
 
 		ioc_info(mrioc,
 		    "MSI-X vectors supported: %d, no of cores: %d,",
 		    mrioc->msix_count, mrioc->cpu_count);
 		ioc_info(mrioc,
-		    "MSI-x vectors requested: %d\n", max_vectors);
-	}
+		    "MSI-x vectors requested: %d poll_queues %d\n",
+		    max_vectors, mrioc->requested_poll_qcount);
 
-	irq_flags |= PCI_IRQ_AFFINITY | PCI_IRQ_ALL_TYPES;
+		desc.post_vectors = mrioc->requested_poll_qcount;
+		min_vec = desc.pre_vectors + desc.post_vectors;
+		irq_flags |= PCI_IRQ_AFFINITY | PCI_IRQ_ALL_TYPES;
 
-	mrioc->op_reply_q_offset = (max_vectors > 1) ? 1 : 0;
-	retval = pci_alloc_irq_vectors_affinity(mrioc->pdev,
-				1, max_vectors, irq_flags, &desc);
-	if (retval < 0) {
-		ioc_err(mrioc, "Cannot alloc irq vectors\n");
-		goto out_failed;
-	}
-	if (retval != max_vectors) {
-		ioc_info(mrioc,
-		    "allocated vectors (%d) are less than configured (%d)\n",
-		    retval, max_vectors);
+		retval = pci_alloc_irq_vectors_affinity(mrioc->pdev,
+			min_vec, max_vectors, irq_flags, &desc);
+
+		if (retval < 0) {
+			ioc_err(mrioc, "cannot allocate irq vectors, ret %d\n",
+			    retval);
+			goto out_failed;
+		}
+
+
 		/*
 		 * If only one MSI-x is allocated, then MSI-x 0 will be shared
 		 * between Admin queue and operational queue
 		 */
-		if (retval == 1)
+		if (retval == min_vec)
 			mrioc->op_reply_q_offset = 0;
+		else if (retval != (max_vectors)) {
+			ioc_info(mrioc,
+			    "allocated vectors (%d) are less than configured (%d)\n",
+			    retval, max_vectors);
+		}
 
 		max_vectors = retval;
+		mrioc->op_reply_q_offset = (max_vectors > 1) ? 1 : 0;
+
+		mpi3mr_calc_poll_queues(mrioc, max_vectors);
+
 	}
+
 	mrioc->intr_info = kzalloc(sizeof(struct mpi3mr_intr_info) * max_vectors,
 	    GFP_KERNEL);
 	if (!mrioc->intr_info) {
@@ -1536,24 +1651,28 @@ static void mpi3mr_free_op_reply_q_segments(struct mpi3mr_ioc *mrioc, u16 q_idx)
 static int mpi3mr_delete_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 {
 	struct mpi3_delete_reply_queue_request delq_req;
+	struct op_reply_qinfo *op_reply_q = mrioc->op_reply_qinfo + qidx;
 	int retval = 0;
 	u16 reply_qid = 0, midx;
 
-	reply_qid = mrioc->op_reply_qinfo[qidx].qid;
+	reply_qid = op_reply_q->qid;
 
 	midx = REPLY_QUEUE_IDX_TO_MSIX_IDX(qidx, mrioc->op_reply_q_offset);
 
 	if (!reply_qid)	{
 		retval = -1;
-		ioc_err(mrioc, "Issue DelRepQ: called with invalid ReqQID\n");
+		ioc_err(mrioc, "delete reply queue failed due to invalid reply queue id\n");
 		goto out;
 	}
+
+	(op_reply_q->qtype == MPI3MR_DEFAULT_QUEUE) ? mrioc->default_qcount-- :
+	    mrioc->active_poll_qcount--;
 
 	memset(&delq_req, 0, sizeof(delq_req));
 	mutex_lock(&mrioc->init_cmds.mutex);
 	if (mrioc->init_cmds.state & MPI3MR_CMD_PENDING) {
 		retval = -1;
-		ioc_err(mrioc, "Issue DelRepQ: Init command is in use\n");
+		ioc_err(mrioc, "sending delete reply queue failed due to command in use\n");
 		mutex_unlock(&mrioc->init_cmds.mutex);
 		goto out;
 	}
@@ -1750,6 +1869,7 @@ static int mpi3mr_create_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 	op_reply_q->ephase = 1;
 	atomic_set(&op_reply_q->pend_ios, 0);
 	atomic_set(&op_reply_q->in_use, 0);
+	atomic_set(&op_reply_q->busy_mq_poll, 0);
 	op_reply_q->enable_irq_poll = false;
 
 	if (!op_reply_q->q_segments) {
@@ -1773,8 +1893,26 @@ static int mpi3mr_create_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 	create_req.host_tag = cpu_to_le16(MPI3MR_HOSTTAG_INITCMDS);
 	create_req.function = MPI3_FUNCTION_CREATE_REPLY_QUEUE;
 	create_req.queue_id = cpu_to_le16(reply_qid);
-	create_req.flags = MPI3_CREATE_REPLY_QUEUE_FLAGS_INT_ENABLE_ENABLE;
-	create_req.msix_index = cpu_to_le16(mrioc->intr_info[midx].msix_index);
+
+	if (midx < (mrioc->intr_info_count - mrioc->requested_poll_qcount))
+		op_reply_q->qtype = MPI3MR_DEFAULT_QUEUE;
+	else
+		op_reply_q->qtype = MPI3MR_POLL_QUEUE;
+
+	if (op_reply_q->qtype == MPI3MR_DEFAULT_QUEUE) {
+		create_req.flags =
+			MPI3_CREATE_REPLY_QUEUE_FLAGS_INT_ENABLE_ENABLE;
+		create_req.msix_index =
+			cpu_to_le16(mrioc->intr_info[midx].msix_index);
+	} else {
+		create_req.msix_index = cpu_to_le16(mrioc->intr_info_count - 1);
+		ioc_info(mrioc, "create reply queue(polled): for qid(%d), midx(%d)\n",
+			reply_qid, midx);
+		if (!mrioc->active_poll_qcount)
+			disable_irq_nosync(pci_irq_vector(mrioc->pdev,
+			    mrioc->intr_info_count - 1));
+	}
+
 	if (mrioc->enable_segqueue) {
 		create_req.flags |=
 		    MPI3_CREATE_REQUEST_QUEUE_FLAGS_SEGMENTED_SEGMENTED;
@@ -1814,6 +1952,9 @@ static int mpi3mr_create_op_reply_q(struct mpi3mr_ioc *mrioc, u16 qidx)
 	op_reply_q->qid = reply_qid;
 	if (midx < mrioc->intr_info_count)
 		mrioc->intr_info[midx].op_reply_q = op_reply_q;
+
+	(op_reply_q->qtype == MPI3MR_DEFAULT_QUEUE) ? mrioc->default_qcount++ :
+	    mrioc->active_poll_qcount++;
 
 out_unlock:
 	mrioc->init_cmds.state = MPI3MR_CMD_NOTUSED;
@@ -1995,8 +2136,10 @@ static int mpi3mr_create_op_queues(struct mpi3mr_ioc *mrioc)
 		goto out_failed;
 	}
 	mrioc->num_op_reply_q = mrioc->num_op_req_q = i;
-	ioc_info(mrioc, "Successfully created %d Operational Q pairs\n",
-	    mrioc->num_op_reply_q);
+	ioc_info(mrioc,
+	    "successfully created %d operational queue pairs(default/polled) queue = (%d/%d)\n",
+	    mrioc->num_op_reply_q, mrioc->default_qcount,
+	    mrioc->active_poll_qcount);
 
 	return retval;
 out_failed:
@@ -2044,7 +2187,7 @@ int mpi3mr_op_request_post(struct mpi3mr_ioc *mrioc,
 	if (mpi3mr_check_req_qfull(op_req_q)) {
 		midx = REPLY_QUEUE_IDX_TO_MSIX_IDX(
 		    reply_qidx, mrioc->op_reply_q_offset);
-		mpi3mr_process_op_reply_q(mrioc, &mrioc->intr_info[midx]);
+		mpi3mr_process_op_reply_q(mrioc, mrioc->intr_info[midx].op_reply_q);
 
 		if (mpi3mr_check_req_qfull(op_req_q)) {
 			retval = -EAGAIN;
@@ -3481,8 +3624,12 @@ int mpi3mr_setup_resources(struct mpi3mr_ioc *mrioc)
 	ioc_info(mrioc, "iomem(0x%016llx), mapped(0x%p), size(%d)\n",
 	    (unsigned long long)mrioc->sysif_regs_phys,
 	    mrioc->sysif_regs, memap_sz);
-	ioc_info(mrioc, "Number of MSI-X vectors found in capabilities: (%d)\n",
+	ioc_info(mrioc, "number of MSI-X vectors found in capabilities: (%d)\n",
 	    mrioc->msix_count);
+
+	if (!reset_devices && poll_queues > 0)
+		mrioc->requested_poll_qcount = min_t(int, poll_queues,
+				mrioc->msix_count - 2);
 	return retval;
 
 out_failed:
@@ -3843,6 +3990,8 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
 	u16 i;
 
 	mrioc->change_count = 0;
+	mrioc->active_poll_qcount = 0;
+	mrioc->default_qcount = 0;
 	if (mrioc->admin_req_base)
 		memset(mrioc->admin_req_base, 0, mrioc->admin_req_q_sz);
 	if (mrioc->admin_reply_base)
@@ -3871,6 +4020,7 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
 		mrioc->op_reply_qinfo[i].ephase = 0;
 		atomic_set(&mrioc->op_reply_qinfo[i].pend_ios, 0);
 		atomic_set(&mrioc->op_reply_qinfo[i].in_use, 0);
+		atomic_set(&mrioc->op_reply_qinfo[i].busy_mq_poll, 0);
 		mpi3mr_memset_op_reply_q_buffers(mrioc, i);
 
 		mrioc->req_qinfo[i].ci = 0;
