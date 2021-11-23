@@ -21,17 +21,20 @@ MODULE_LICENSE(MPI3MR_DRIVER_LICENSE);
 MODULE_VERSION(MPI3MR_DRIVER_VERSION);
 
 /* Module parameters*/
-int prot_mask = -1;
-module_param(prot_mask, int, 0);
-MODULE_PARM_DESC(prot_mask, "Host protection capabilities mask, def=0x07");
-
-static int prot_guard_mask = 3;
-module_param(prot_guard_mask, int, 0);
-MODULE_PARM_DESC(prot_guard_mask, " Host protection guard mask, def=3");
 static int logging_level;
 module_param(logging_level, int, 0);
 MODULE_PARM_DESC(logging_level,
 	" bits for enabling additional logging info (default=0)");
+
+static bool enable_dif = true;
+module_param(enable_dif, bool, 0444);
+MODULE_PARM_DESC(enable_dif,
+	"Enable Data Integrity Format (DIF) support (Default = 1)");
+
+bool enable_dix;
+module_param(enable_dix, bool, 0444);
+MODULE_PARM_DESC(enable_dix,
+	"Enable Data Integrity Extensions (DIX) support (Default = 0)");
 
 /* Forward declarations*/
 static void mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
@@ -812,7 +815,6 @@ static void mpi3mr_update_tgtdev(struct mpi3mr_ioc *mrioc,
 {
 	u16 flags = 0;
 	struct mpi3mr_stgt_priv_data *scsi_tgt_priv_data;
-	u8 prot_mask = 0;
 
 	tgtdev->perst_id = le16_to_cpu(dev_pg0->persistent_id);
 	tgtdev->dev_handle = le16_to_cpu(dev_pg0->dev_handle);
@@ -893,16 +895,6 @@ static void mpi3mr_update_tgtdev(struct mpi3mr_ioc *mrioc,
 		    ((dev_info & MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_MASK) !=
 		    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_SCSI_DEVICE))
 			tgtdev->is_hidden = 1;
-		if (!mrioc->shost)
-			break;
-		prot_mask = scsi_host_get_prot(mrioc->shost);
-		if (prot_mask & SHOST_DIX_TYPE0_PROTECTION) {
-			scsi_host_set_prot(mrioc->shost, prot_mask & 0x77);
-			ioc_info(mrioc,
-			    "%s : Disabling DIX0 prot capability\n", __func__);
-			ioc_info(mrioc,
-			    "because HBA does not support DIX0 operation on NVME drives\n");
-		}
 		break;
 	}
 	case MPI3_DEVICE_DEVFORM_VD:
@@ -2157,7 +2149,52 @@ void mpi3mr_os_handle_events(struct mpi3mr_ioc *mrioc,
 }
 
 /**
- * mpi3mr_setup_eedp - Setup EEDP information in MPI3 SCSI IO
+ * mpi3mr_setup_nvme_eedp - Setup DIF info for NVMe IO request
+ * @mrioc: Adapter instance reference
+ * @scmd: SCSI command reference
+ * @scsiio_req: MPI3 SCSI IO request
+ *
+ * Identifies the protection information flags from the SCSI
+ * command and set appropriate flags in the MPI3 SCSI IO request
+ * for the I/Os issued to the NVMe drives.
+ *
+ * Return: Nothing
+ */
+static void mpi3mr_setup_nvme_eedp(struct mpi3mr_ioc *mrioc,
+	struct scsi_cmnd *scmd, struct mpi3_scsi_io_request *scsiio_req)
+{
+	unsigned char prot_op = scsi_get_prot_op(scmd);
+	u8 host_md = 0, opcode = scmd->cmnd[0], sa = scmd->cmnd[9], xprt = 0;
+
+
+	if ((prot_op == SCSI_PROT_READ_PASS) ||
+	    (prot_op == SCSI_PROT_WRITE_PASS)) {
+		host_md = 1;
+		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_METASGL_VALID;
+	}
+
+	if (!mrioc->check_xprotect_nvme)
+		return;
+
+	if (!((opcode == READ_10) || (opcode == WRITE_10) ||
+	    (opcode == READ_12) || (opcode == WRITE_12) ||
+	    (opcode == READ_16) || (opcode == WRITE_16) ||
+	    ((opcode == VARIABLE_LENGTH_CMD) &&
+	    ((sa == READ_32) || (sa == WRITE_32)))))
+		return;
+	if (opcode == VARIABLE_LENGTH_CMD)
+		xprt = scmd->cmnd[10] & 0xe0;
+	else
+		xprt = scmd->cmnd[1] & 0xe0;
+	if (!xprt) {
+		scsiio_req->msg_flags &= ~MPI3_SCSIIO_MSGFLAGS_METASGL_VALID;
+		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_DIVERT_TO_FIRMWARE;
+	} else if (!host_md)
+		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_DIVERT_TO_FIRMWARE;
+}
+
+/**
+ * mpi3mr_setup_sas_eedp - Setup EEDP information in MPI3 SCSI IO
  * @mrioc: Adapter instance reference
  * @scmd: SCSI command reference
  * @scsiio_req: MPI3 SCSI IO request
@@ -2168,12 +2205,13 @@ void mpi3mr_os_handle_events(struct mpi3mr_ioc *mrioc,
  *
  * Return: Nothing
  */
-static void mpi3mr_setup_eedp(struct mpi3mr_ioc *mrioc,
+static void mpi3mr_setup_sas_eedp(struct mpi3mr_ioc *mrioc,
 	struct scsi_cmnd *scmd, struct mpi3_scsi_io_request *scsiio_req)
 {
 	u16 eedp_flags = 0;
 	unsigned char prot_op = scsi_get_prot_op(scmd);
 
+	scsiio_req->sgl[0].eedp.flags = MPI3_SGE_FLAGS_ELEMENT_TYPE_SIMPLE;
 	switch (prot_op) {
 	case SCSI_PROT_NORMAL:
 		return;
@@ -2192,17 +2230,8 @@ static void mpi3mr_setup_eedp(struct mpi3mr_ioc *mrioc,
 		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_METASGL_VALID;
 		break;
 	case SCSI_PROT_READ_PASS:
-		eedp_flags = MPI3_EEDPFLAGS_EEDP_OP_CHECK;
-		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_METASGL_VALID;
-		break;
 	case SCSI_PROT_WRITE_PASS:
-		if (scmd->prot_flags & SCSI_PROT_IP_CHECKSUM) {
-			eedp_flags = MPI3_EEDPFLAGS_EEDP_OP_CHECK_REGEN;
-			scsiio_req->sgl[0].eedp.application_tag_translation_mask =
-			    0xffff;
-		} else
-			eedp_flags = MPI3_EEDPFLAGS_EEDP_OP_CHECK;
-
+		eedp_flags = MPI3_EEDPFLAGS_EEDP_OP_CHECK;
 		scsiio_req->msg_flags |= MPI3_SCSIIO_MSGFLAGS_METASGL_VALID;
 		break;
 	default:
@@ -2211,9 +2240,6 @@ static void mpi3mr_setup_eedp(struct mpi3mr_ioc *mrioc,
 
 	if (scmd->prot_flags & SCSI_PROT_GUARD_CHECK)
 		eedp_flags |= MPI3_EEDPFLAGS_CHK_GUARD;
-
-	if (scmd->prot_flags & SCSI_PROT_IP_CHECKSUM)
-		eedp_flags |= MPI3_EEDPFLAGS_HOST_GUARD_IP_CHKSUM;
 
 	if (scmd->prot_flags & SCSI_PROT_REF_CHECK) {
 		eedp_flags |= MPI3_EEDPFLAGS_CHK_REF_TAG |
@@ -3519,6 +3545,15 @@ static int mpi3mr_target_alloc(struct scsi_target *starget)
 		tgt_dev->starget = starget;
 		atomic_set(&scsi_tgt_priv_data->block_io, 0);
 		retval = 0;
+		if ((tgt_dev->dev_type ==
+		    MPI3_DEVICE_DEVFORM_PCIE) &&
+		    ((tgt_dev->dev_spec.pcie_inf.dev_info &
+		    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_MASK) ==
+		    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_NVME_DEVICE) &&
+		    ((tgt_dev->dev_spec.pcie_inf.dev_info &
+		    MPI3_DEVICE0_PCIE_DEVICE_INFO_PITYPE_MASK) !=
+		    MPI3_DEVICE0_PCIE_DEVICE_INFO_PITYPE_0))
+			scsi_tgt_priv_data->dev_nvme_dif = 1;
 	} else
 		retval = -ENXIO;
 	spin_unlock_irqrestore(&mrioc->tgtdev_lock, flags);
@@ -3759,7 +3794,10 @@ static int mpi3mr_qcmd(struct Scsi_Host *shost,
 	scsiio_req->function = MPI3_FUNCTION_SCSI_IO;
 	scsiio_req->host_tag = cpu_to_le16(host_tag);
 
-	mpi3mr_setup_eedp(mrioc, scmd, scsiio_req);
+	if (!is_pcie_dev)
+		mpi3mr_setup_sas_eedp(mrioc, scmd, scsiio_req);
+	else if (stgt_priv_data->dev_nvme_dif)
+		mpi3mr_setup_nvme_eedp(mrioc, scmd, scsiio_req);
 
 	memcpy(scsiio_req->cdb.cdb32, scmd->cmnd, scmd->cmd_len);
 	scsiio_req->data_length = cpu_to_le32(scsi_bufflen(scmd));
@@ -3926,7 +3964,7 @@ mpi3mr_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct mpi3mr_ioc *mrioc = NULL;
 	struct Scsi_Host *shost = NULL;
-	int retval = 0, i;
+	int retval = 0, i, prot_mask = 0;
 
 	if (osintfc_mrioc_security_status(pdev)) {
 		warn_non_secure_ctlr = 1;
@@ -3988,30 +4026,39 @@ mpi3mr_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	shost->max_channel = 0;
 	shost->max_id = 0xFFFFFFFF;
 
-	if (prot_mask >= 0)
-		scsi_host_set_prot(shost, prot_mask);
-	else {
+	if (enable_dix)  {
+		prot_mask = SHOST_DIF_TYPE1_PROTECTION
+		    | SHOST_DIF_TYPE2_PROTECTION
+		    | SHOST_DIF_TYPE3_PROTECTION
+		    | SHOST_DIX_TYPE1_PROTECTION
+		    | SHOST_DIX_TYPE2_PROTECTION
+		    | SHOST_DIX_TYPE3_PROTECTION;
+		enable_dif = true;
+	} else if (enable_dif)
 		prot_mask = SHOST_DIF_TYPE1_PROTECTION
 		    | SHOST_DIF_TYPE2_PROTECTION
 		    | SHOST_DIF_TYPE3_PROTECTION;
-		scsi_host_set_prot(shost, prot_mask);
-	}
+	else
+		prot_mask = 0;
+
+	scsi_host_set_prot(shost, prot_mask);
+
+	if (enable_dix && (pdev->device == MPI3_MFGPAGE_DEVID_SAS4116) &&
+	    pdev->revision)
+		mrioc->check_xprotect_nvme = true;
+	else
+		mrioc->check_xprotect_nvme = false;
 
 	ioc_info(mrioc,
-	    "%s :host protection capabilities enabled %s%s%s%s%s%s%s\n",
-	    __func__,
+	    "host protection capabilities enabled %s%s%s%s%s%s\n",
 	    (prot_mask & SHOST_DIF_TYPE1_PROTECTION) ? " DIF1" : "",
 	    (prot_mask & SHOST_DIF_TYPE2_PROTECTION) ? " DIF2" : "",
 	    (prot_mask & SHOST_DIF_TYPE3_PROTECTION) ? " DIF3" : "",
-	    (prot_mask & SHOST_DIX_TYPE0_PROTECTION) ? " DIX0" : "",
 	    (prot_mask & SHOST_DIX_TYPE1_PROTECTION) ? " DIX1" : "",
 	    (prot_mask & SHOST_DIX_TYPE2_PROTECTION) ? " DIX2" : "",
 	    (prot_mask & SHOST_DIX_TYPE3_PROTECTION) ? " DIX3" : "");
 
-	if (prot_guard_mask)
-		scsi_host_set_guard(shost, (prot_guard_mask & 3));
-	else
-		scsi_host_set_guard(shost, SHOST_DIX_GUARD_CRC);
+	scsi_host_set_guard(shost, SHOST_DIX_GUARD_CRC);
 
 	snprintf(mrioc->fwevt_worker_name, sizeof(mrioc->fwevt_worker_name),
 	    "%s%d_fwevt_wrkr", mrioc->driver_name, mrioc->id);

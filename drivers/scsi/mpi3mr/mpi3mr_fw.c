@@ -14,6 +14,8 @@ static int mpi3mr_setup_admin_qpair(struct mpi3mr_ioc *mrioc);
 static void mpi3mr_process_factsdata(struct mpi3mr_ioc *mrioc,
 	struct mpi3_ioc_facts_data *facts_data);
 
+extern bool enable_dix;
+
 #if defined(writeq) && defined(CONFIG_64BIT)
 static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
 	spinlock_t *write_queue_lock)
@@ -2944,6 +2946,10 @@ static int mpi3mr_issue_iocinit(struct mpi3mr_ioc *mrioc)
 	current_time = ktime_get_real();
 	iocinit_req.time_stamp = cpu_to_le64(ktime_to_ms(current_time));
 
+	if (enable_dix)
+		iocinit_req.msg_flags |=
+		    MPI3_IOCINIT_MSGFLAGS_HOSTMETADATA_SEPARATED;
+
 	init_completion(&mrioc->init_cmds.done);
 	retval = mpi3mr_admin_request_post(mrioc, &iocinit_req,
 	    sizeof(iocinit_req), 1);
@@ -3163,13 +3169,10 @@ static int mpi3mr_alloc_chain_bufs(struct mpi3mr_ioc *mrioc)
 	if (mrioc->chain_sgl_list)
 		return retval;
 
-	num_chains = mrioc->max_host_ios / MPI3MR_CHAINBUF_FACTOR;
+	num_chains = mrioc->max_host_ios;
 
-	if (prot_mask & (SHOST_DIX_TYPE0_PROTECTION
-	    | SHOST_DIX_TYPE1_PROTECTION
-	    | SHOST_DIX_TYPE2_PROTECTION
-	    | SHOST_DIX_TYPE3_PROTECTION))
-		num_chains += (num_chains / MPI3MR_CHAINBUFDIX_FACTOR);
+	if (enable_dix)
+		num_chains *= 2;
 
 	mrioc->chain_buf_count = num_chains;
 	sz = sizeof(struct chain_element) * num_chains;
@@ -3177,7 +3180,7 @@ static int mpi3mr_alloc_chain_bufs(struct mpi3mr_ioc *mrioc)
 	if (!mrioc->chain_sgl_list)
 		goto out_failed;
 
-	sz = MPI3MR_PAGE_SIZE_4K;
+	sz = MPI3MR_CHAINSGE_SIZE;
 	mrioc->chain_buf_pool = dma_pool_create("chain_buf pool",
 	    &mrioc->pdev->dev, sz, 16, 0);
 	if (!mrioc->chain_buf_pool) {
