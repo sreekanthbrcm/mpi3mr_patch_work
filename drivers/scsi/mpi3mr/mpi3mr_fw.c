@@ -334,6 +334,12 @@ mpi3mr_get_drv_cmd(struct mpi3mr_ioc *mrioc, u16 host_tag,
 		return &mrioc->dev_rmhs_cmds[idx];
 	}
 
+	if (host_tag >= MPI3MR_HOSTTAG_EVTACKCMD_MIN &&
+	    host_tag <= MPI3MR_HOSTTAG_EVTACKCMD_MAX) {
+		idx = host_tag - MPI3MR_HOSTTAG_EVTACKCMD_MIN;
+		return &mrioc->evtack_cmds[idx];
+	}
+
 	return NULL;
 }
 
@@ -2275,7 +2281,8 @@ static void mpi3mr_watchdog_work(struct work_struct *work)
 	    container_of(work, struct mpi3mr_ioc, watchdog_work.work);
 	unsigned long flags;
 	enum mpi3mr_iocstate ioc_state;
-	u32 fault, host_diagnostic;
+	u32 fault, host_diagnostic, ioc_status;
+	u32 reset_reason = MPI3MR_RESET_FROM_FAULT_WATCH;
 
 	if (mrioc->reset_in_progress || mrioc->unrecoverable)
 		return;
@@ -2285,43 +2292,55 @@ static void mpi3mr_watchdog_work(struct work_struct *work)
 		mpi3mr_sync_timestamp(mrioc);
 	}
 
+	if ((mrioc->prepare_for_reset) &&
+	    ((mrioc->prepare_for_reset_timeout_counter++) >=
+	     MPI3MR_PREPARE_FOR_RESET_TIMEOUT)) {
+		mpi3mr_soft_reset_handler(mrioc,
+		    MPI3MR_RESET_FROM_CIACTVRST_TIMER, 1);
+		return;
+	}
+
+	ioc_status = readl(&mrioc->sysif_regs->ioc_status);
+	if (ioc_status & MPI3_SYSIF_IOC_STATUS_RESET_HISTORY) {
+		mpi3mr_soft_reset_handler(mrioc, MPI3MR_RESET_FROM_FIRMWARE, 0);
+		return;
+	}
+
 	/*Check for fault state every one second and issue Soft reset*/
 	ioc_state = mpi3mr_get_iocstate(mrioc);
-	if (ioc_state == MRIOC_STATE_FAULT) {
-		fault = readl(&mrioc->sysif_regs->fault) &
-		    MPI3_SYSIF_FAULT_CODE_MASK;
-		host_diagnostic = readl(&mrioc->sysif_regs->host_diagnostic);
-		if (host_diagnostic & MPI3_SYSIF_HOST_DIAG_SAVE_IN_PROGRESS) {
-			if (!mrioc->diagsave_timeout) {
-				mpi3mr_print_fault_info(mrioc);
-				ioc_warn(mrioc, "Diag save in progress\n");
-			}
-			if ((mrioc->diagsave_timeout++) <=
-			    MPI3_SYSIF_DIAG_SAVE_TIMEOUT)
-				goto schedule_work;
-		} else
+	if (ioc_state != MRIOC_STATE_FAULT)
+		goto schedule_work;
+
+	fault = readl(&mrioc->sysif_regs->fault) & MPI3_SYSIF_FAULT_CODE_MASK;
+	host_diagnostic = readl(&mrioc->sysif_regs->host_diagnostic);
+	if (host_diagnostic & MPI3_SYSIF_HOST_DIAG_SAVE_IN_PROGRESS) {
+		if (!mrioc->diagsave_timeout) {
 			mpi3mr_print_fault_info(mrioc);
-		mrioc->diagsave_timeout = 0;
-
-		if (fault == MPI3_SYSIF_FAULT_CODE_POWER_CYCLE_REQUIRED) {
-			ioc_info(mrioc,
-			    "Factory Reset fault occurred marking controller as unrecoverable"
-			    );
-			mrioc->unrecoverable = 1;
-			goto out;
+			ioc_warn(mrioc, "diag save in progress\n");
 		}
-
-		if ((fault == MPI3_SYSIF_FAULT_CODE_DIAG_FAULT_RESET) ||
-		    (fault == MPI3_SYSIF_FAULT_CODE_SOFT_RESET_IN_PROGRESS) ||
-		    (mrioc->reset_in_progress))
-			goto out;
-		if (fault == MPI3_SYSIF_FAULT_CODE_CI_ACTIVATION_RESET)
-			mpi3mr_soft_reset_handler(mrioc,
-			    MPI3MR_RESET_FROM_CIACTIV_FAULT, 0);
-		else
-			mpi3mr_soft_reset_handler(mrioc,
-			    MPI3MR_RESET_FROM_FAULT_WATCH, 0);
+		if ((mrioc->diagsave_timeout++) <= MPI3_SYSIF_DIAG_SAVE_TIMEOUT)
+			goto schedule_work;
 	}
+
+	mpi3mr_print_fault_info(mrioc);
+	mrioc->diagsave_timeout = 0;
+
+	switch (fault) {
+	case MPI3_SYSIF_FAULT_CODE_POWER_CYCLE_REQUIRED:
+		ioc_info(mrioc,
+		    "controller requires system power cycle, marking controller as unrecoverable\n");
+		mrioc->unrecoverable = 1;
+		return;
+	case MPI3_SYSIF_FAULT_CODE_SOFT_RESET_IN_PROGRESS:
+		return;
+	case MPI3_SYSIF_FAULT_CODE_CI_ACTIVATION_RESET:
+		reset_reason = MPI3MR_RESET_FROM_CIACTIV_FAULT;
+		break;
+	default:
+		break;
+	}
+	mpi3mr_soft_reset_handler(mrioc, reset_reason, 0);
+	return;
 
 schedule_work:
 	spin_lock_irqsave(&mrioc->watchdog_lock, flags);
@@ -2330,7 +2349,6 @@ schedule_work:
 		    &mrioc->watchdog_work,
 		    msecs_to_jiffies(MPI3MR_WATCHDOG_INTERVAL));
 	spin_unlock_irqrestore(&mrioc->watchdog_lock, flags);
-out:
 	return;
 }
 
@@ -2733,6 +2751,14 @@ static int mpi3mr_alloc_reply_sense_bufs(struct mpi3mr_ioc *mrioc)
 	if (!mrioc->devrem_bitmap)
 		goto out_failed;
 
+	mrioc->evtack_cmds_bitmap_sz = MPI3MR_NUM_EVTACKCMD / 8;
+	if (MPI3MR_NUM_EVTACKCMD % 8)
+		mrioc->evtack_cmds_bitmap_sz++;
+	mrioc->evtack_cmds_bitmap = kzalloc(mrioc->evtack_cmds_bitmap_sz,
+	    GFP_KERNEL);
+	if (!mrioc->evtack_cmds_bitmap)
+		goto out_failed;
+
 	mrioc->num_reply_bufs = mrioc->facts.max_reqs + MPI3MR_NUM_EVT_REPLIES;
 	mrioc->reply_free_qsz = mrioc->num_reply_bufs + 1;
 	mrioc->num_sense_bufs = mrioc->facts.max_reqs / MPI3MR_SENSEBUF_FACTOR;
@@ -3052,17 +3078,17 @@ out:
 }
 
 /**
- * mpi3mr_send_event_ack - Send event acknowledgment
+ * mpi3mr_process_event_ack - Process event acknowledgment
  * @mrioc: Adapter instance reference
  * @event: MPI3 event ID
- * @event_ctx: Event context
+ * @event_ctx: event context
  *
  * Send event acknowledgment through admin queue and wait for
  * it to complete.
  *
  * Return: 0 on success, non-zero on failures.
  */
-int mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
+int mpi3mr_process_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
 	u32 event_ctx)
 {
 	struct mpi3_event_ack_request evtack_req;
@@ -3072,7 +3098,7 @@ int mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
 	mutex_lock(&mrioc->init_cmds.mutex);
 	if (mrioc->init_cmds.state & MPI3MR_CMD_PENDING) {
 		retval = -1;
-		ioc_err(mrioc, "Send EvtAck: Init command is in use\n");
+		ioc_err(mrioc, "sending blocking event ack failed due to command in use\n");
 		mutex_unlock(&mrioc->init_cmds.mutex);
 		goto out;
 	}
@@ -3088,13 +3114,13 @@ int mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
 	retval = mpi3mr_admin_request_post(mrioc, &evtack_req,
 	    sizeof(evtack_req), 1);
 	if (retval) {
-		ioc_err(mrioc, "Send EvtAck: Admin Post failed\n");
+		ioc_err(mrioc, "posting event ack request failed\n");
 		goto out_unlock;
 	}
 	wait_for_completion_timeout(&mrioc->init_cmds.done,
 	    (MPI3MR_INTADMCMD_TIMEOUT * HZ));
 	if (!(mrioc->init_cmds.state & MPI3MR_CMD_COMPLETE)) {
-		ioc_err(mrioc, "Issue EvtNotify: command timed out\n");
+		ioc_err(mrioc, "blocking event ack request timed out\n");
 		if (!(mrioc->init_cmds.state & MPI3MR_CMD_RESET))
 			mpi3mr_soft_reset_handler(mrioc,
 			    MPI3MR_RESET_FROM_EVTACK_TIMEOUT, 1);
@@ -3104,7 +3130,7 @@ int mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
 	if ((mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK)
 	    != MPI3_IOCSTATUS_SUCCESS) {
 		ioc_err(mrioc,
-		    "Send EvtAck: Failed ioc_status(0x%04x) Loginfo(0x%08x)\n",
+		    "blocking event ack returned with ioc_status(0x%04x), log_info(0x%08x)\n",
 		    (mrioc->init_cmds.ioc_status & MPI3_IOCSTATUS_STATUS_MASK),
 		    mrioc->init_cmds.ioc_loginfo);
 		retval = -1;
@@ -3826,8 +3852,13 @@ void mpi3mr_memset_buffers(struct mpi3mr_ioc *mrioc)
 		for (i = 0; i < MPI3MR_NUM_DEVRMCMD; i++)
 			memset(mrioc->dev_rmhs_cmds[i].reply, 0,
 			    sizeof(*mrioc->dev_rmhs_cmds[i].reply));
+		for (i = 0; i < MPI3MR_NUM_EVTACKCMD; i++)
+			memset(mrioc->evtack_cmds[i].reply, 0,
+			    sizeof(*mrioc->evtack_cmds[i].reply));
 		memset(mrioc->removepend_bitmap, 0, mrioc->dev_handle_bitmap_sz);
 		memset(mrioc->devrem_bitmap, 0, mrioc->devrem_bitmap_sz);
+		memset(mrioc->evtack_cmds_bitmap, 0,
+		    mrioc->evtack_cmds_bitmap_sz);
 	}
 
 	for (i = 0; i < mrioc->num_queues; i++) {
@@ -3927,11 +3958,19 @@ void mpi3mr_free_mem(struct mpi3mr_ioc *mrioc)
 		mrioc->dev_rmhs_cmds[i].reply = NULL;
 	}
 
+	for (i = 0; i < MPI3MR_NUM_EVTACKCMD; i++) {
+		kfree(mrioc->evtack_cmds[i].reply);
+		mrioc->evtack_cmds[i].reply = NULL;
+	}
+
 	kfree(mrioc->removepend_bitmap);
 	mrioc->removepend_bitmap = NULL;
 
 	kfree(mrioc->devrem_bitmap);
 	mrioc->devrem_bitmap = NULL;
+
+	kfree(mrioc->evtack_cmds_bitmap);
+	mrioc->evtack_cmds_bitmap = NULL;
 
 	kfree(mrioc->chain_bitmap);
 	mrioc->chain_bitmap = NULL;
@@ -4105,6 +4144,11 @@ static void mpi3mr_flush_drv_cmds(struct mpi3mr_ioc *mrioc)
 		cmdptr = &mrioc->dev_rmhs_cmds[i];
 		mpi3mr_drv_cmd_comp_reset(mrioc, cmdptr);
 	}
+
+	for (i = 0; i < MPI3MR_NUM_EVTACKCMD; i++) {
+		cmdptr = &mrioc->evtack_cmds[i];
+		mpi3mr_drv_cmd_comp_reset(mrioc, cmdptr);
+	}
 }
 
 /**
@@ -4208,9 +4252,14 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
 	mpi3mr_flush_drv_cmds(mrioc);
 	memset(mrioc->devrem_bitmap, 0, mrioc->devrem_bitmap_sz);
 	memset(mrioc->removepend_bitmap, 0, mrioc->dev_handle_bitmap_sz);
+	memset(mrioc->evtack_cmds_bitmap, 0, mrioc->evtack_cmds_bitmap_sz);
 	mpi3mr_cleanup_fwevt_list(mrioc);
 	mpi3mr_flush_host_io(mrioc);
 	mpi3mr_invalidate_devhandles(mrioc);
+	if (mrioc->prepare_for_reset) {
+		mrioc->prepare_for_reset = 0;
+		mrioc->prepare_for_reset_timeout_counter = 0;
+	}
 	mpi3mr_memset_buffers(mrioc);
 	dprint_reset(mrioc,
 	    "soft_reset_handler: reinitializing the controller\n");
